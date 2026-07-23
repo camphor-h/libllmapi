@@ -1,0 +1,136 @@
+# libllmapi
+
+A C99 library for calling LLM APIs (OpenAI-compatible) using **libcurl** and **cjson**.
+
+## Dependencies
+
+- [libcurl](https://curl.se/libcurl/)
+- [cjson](https://github.com/DaveGamble/cJSON)
+
+## Build
+
+```sh
+cc -std=c99 -c llmapi.c -o llmapi.o
+cc -std=c99 your_program.c llmapi.o -lcurl -lcjson -o your_program
+```
+
+## Usage
+
+### Sync Chat
+
+```c
+LlmmapiCtx* ctx = llmapiInit();
+
+LlmmapiReq* req = llmapiReqNew("gpt-4");
+llmapiReqAddMsg(req, LLMAPI_ROLE_SYSTEM, "You are a helpful assistant.");
+llmapiReqAddMsg(req, LLMAPI_ROLE_USER,   "What is the capital of France?");
+llmapiReqSetTemperature(req, 0.7);
+llmapiReqSetMaxTokens(req, 200);
+
+char* resp = llmapiChatComplete(ctx, "https://api.openai.com/v1", "sk-...", req);
+if (resp)
+{
+    char* text = llmapiRespGetContent(resp, 0);
+    printf("Reply: %s\n", text);
+    free(text);
+    printf("Tokens: %d\n", llmapiRespGetTotalTokens(resp));
+    free(resp);
+}
+else
+{
+    fprintf(stderr, "Error: %s\n", llmapiStrError(ctx));
+}
+
+llmapiReqFree(req);
+llmapiCleanup(ctx);
+```
+
+### Streaming
+
+```c
+void onChunk(LlmmapiStreamType type, const char* content, int done, void* ud)
+{
+    switch (type)
+    {
+        case LLMAPI_STREAM_TEXT:     printf("%s", content); break;
+        case LLMAPI_STREAM_THINKING: printf("[think] %s", content); break;
+        case LLMAPI_STREAM_TOOL_CALL:printf("[tool] %s", content); break;
+    }
+    if (done) printf("\n[DONE]\n");
+}
+
+llmapiChatCompleteStream(ctx, "https://api.openai.com/v1", "sk-...", req, onChunk, NULL);
+```
+
+### Continuing a Conversation
+
+```c
+// Keep the same req and add messages to it across turns
+char* resp = llmapiChatComplete(ctx, url, key, req);
+char* text = llmapiRespGetContent(resp, 0);
+llmapiReqAddMsg(req, LLMAPI_ROLE_ASSISTANT, text);  // append model reply
+free(text);
+free(resp);
+
+llmapiReqAddMsg(req, LLMAPI_ROLE_USER, "next question");
+resp = llmapiChatComplete(ctx, url, key, req);       // full history sent
+```
+
+### Extra Parameters
+
+```c
+llmapiReqSet(req, "top_p",            "0.9");
+llmapiReqSet(req, "presence_penalty", "0.1");
+llmapiReqSet(req, "stop",             "[\"END\"]");
+llmapiReqSet(req, "seed",             "42");
+```
+
+## API
+
+### Lifecycle / Error / Config
+
+| Function | Description |
+|----------|-------------|
+| `llmapiInit()` / `llmapiCleanup()` | Lifecycle |
+| `llmapiStrError(ctx)` | Last error message |
+| `llmapiSetCaPath(ctx, path)` | Set custom CA bundle (NULL = default) |
+
+### Request
+
+| Function | Description |
+|----------|-------------|
+| `llmapiReqNew(model)` / `llmapiReqFree(req)` | Request lifecycle |
+| `llmapiReqAddMsg(req, role, content)` | Add a message |
+| `llmapiReqSetMaxTokens(req, n)` | Set max_tokens |
+| `llmapiReqSetTemperature(req, t)` | Set temperature |
+| `llmapiReqSet(req, key, jsonValue)` | Generic parameter |
+
+### Chat
+
+| Function | Description |
+|----------|-------------|
+| `llmapiChatComplete(ctx, url, key, req)` | Sync (returns JSON string) |
+| `llmapiChatCompleteStream(ctx, url, key, req, cb, ud)` | Streaming with type-aware callback |
+
+### Response Helpers
+
+| Function | Description |
+|----------|-------------|
+| `llmapiRespGetContent(json, idx)` | `choices[idx].message.content` |
+| `llmapiRespGetReasoningContent(json, idx)` | `choices[idx].message.reasoning_content` |
+| `llmapiRespGetToolCallsJson(json, idx)` | Serialized `choices[idx].message.tool_calls` JSON |
+| `llmapiRespGetTotalTokens(json)` | `usage.total_tokens` |
+| `llmapiRespGetPromptTokens(json)` | `usage.prompt_tokens` |
+| `llmapiRespGetCompletionTokens(json)` | `usage.completion_tokens` |
+
+### Streaming Types
+
+| Value | Meaning |
+|-------|---------|
+| `LLMAPI_STREAM_TEXT` | Regular output text |
+| `LLMAPI_STREAM_THINKING` | Reasoning / chain-of-thought (DeepSeek-R1, etc) |
+| `LLMAPI_STREAM_TOOL_CALL` | Tool call delta (JSON string) |
+
+## License
+
+BSD 2-Clause. See LICENSE file for details.
