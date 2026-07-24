@@ -181,6 +181,9 @@ typedef struct
 {
     char* role;
     char* content;
+    char* toolCallsJson;  // JSON array string for assistant tool_calls
+    char* toolCallId;      // for tool role messages
+    char* toolCallName;    // tool function name (for display)
 } LlmMsg;
 
 struct LlmmapiReq
@@ -234,8 +237,11 @@ static int llmapiHasCrlf(const char* s)
 static LlmMsg llmMsgMake(const char* role, const char* content)
 {
     LlmMsg msg;
-    msg.role    = (char*)malloc(strlen(role) + 1);
-    msg.content = (char*)malloc(strlen(content) + 1);
+    msg.role         = (char*)malloc(strlen(role) + 1);
+    msg.content      = (char*)malloc(strlen(content) + 1);
+    msg.toolCallsJson = NULL;
+    msg.toolCallId   = NULL;
+    msg.toolCallName = NULL;
 
     if (msg.role && msg.content)
     {
@@ -262,6 +268,9 @@ static void llmMsgFree(LlmMsg* msg)
 
     free(msg->role);
     free(msg->content);
+    free(msg->toolCallsJson);
+    free(msg->toolCallId);
+    free(msg->toolCallName);
 }
 
 // ==================== Lifecycle ====================
@@ -441,6 +450,92 @@ void llmapiReqAddMsg(LlmmapiReq* req, const char* role, const char* content)
     req->msgs[req->msgCount++] = msg;
 }
 
+void llmapiReqAddAssistantToolCalls(LlmmapiReq* req, const char* toolCallsJson)
+{
+    if (req == NULL || toolCallsJson == NULL)
+    {
+        return;
+    }
+
+    if (req->msgCount >= req->msgCap)
+    {
+        size_t newCap = req->msgCap == 0 ? 4 : req->msgCap * 2;
+        LlmMsg* p = (LlmMsg*)realloc(req->msgs, newCap * sizeof(LlmMsg));
+        if (p == NULL)
+        {
+            return;
+        }
+        req->msgs   = p;
+        req->msgCap = newCap;
+    }
+
+    LlmMsg msg;
+    msg.role         = (char*)malloc(strlen("assistant") + 1);
+    msg.content      = (char*)malloc(1);
+    msg.toolCallsJson = (char*)malloc(strlen(toolCallsJson) + 1);
+    msg.toolCallId   = NULL;
+    msg.toolCallName = NULL;
+
+    if (msg.role && msg.content && msg.toolCallsJson)
+    {
+        strcpy(msg.role, "assistant");
+        msg.content[0] = '\0';
+        strcpy(msg.toolCallsJson, toolCallsJson);
+    }
+    else
+    {
+        llmMsgFree(&msg);
+        return;
+    }
+
+    req->msgs[req->msgCount++] = msg;
+}
+
+void llmapiReqAddToolResult(LlmmapiReq* req, const char* toolCallId, const char* name, const char* content)
+{
+    if (req == NULL || toolCallId == NULL || content == NULL)
+    {
+        return;
+    }
+
+    if (req->msgCount >= req->msgCap)
+    {
+        size_t newCap = req->msgCap == 0 ? 4 : req->msgCap * 2;
+        LlmMsg* p = (LlmMsg*)realloc(req->msgs, newCap * sizeof(LlmMsg));
+        if (p == NULL)
+        {
+            return;
+        }
+        req->msgs   = p;
+        req->msgCap = newCap;
+    }
+
+    LlmMsg msg;
+    msg.role         = (char*)malloc(strlen("tool") + 1);
+    msg.content      = (char*)malloc(strlen(content) + 1);
+    msg.toolCallId   = (char*)malloc(strlen(toolCallId) + 1);
+    msg.toolCallsJson = NULL;
+    msg.toolCallName = name ? (char*)malloc(strlen(name) + 1) : NULL;
+
+    if (msg.role && msg.content && msg.toolCallId)
+    {
+        strcpy(msg.role, "tool");
+        strcpy(msg.content, content);
+        strcpy(msg.toolCallId, toolCallId);
+        if (msg.toolCallName)
+        {
+            strcpy(msg.toolCallName, name);
+        }
+    }
+    else
+    {
+        llmMsgFree(&msg);
+        return;
+    }
+
+    req->msgs[req->msgCount++] = msg;
+}
+
 void llmapiReqSetMaxTokens(LlmmapiReq* req, size_t maxTokens)
 {
     if (req == NULL)
@@ -474,28 +569,29 @@ void llmapiReqSet(LlmmapiReq* req, const char* key, const char* jsonValue)
     {
         size_t newCap = req->extraCap == 0 ? 4 : req->extraCap * 2;
 
-        char** k = (char**)realloc(req->extraKeys,
-                                   newCap * sizeof(char*));
-        if (k == NULL)
+        char** newKeys = (char**)malloc(newCap * sizeof(char*));
+        if (newKeys == NULL)
         {
             return;
         }
-        req->extraKeys = k;
 
-        char** v = (char**)realloc(req->extraValues,
-                                   newCap * sizeof(char*));
-        if (v == NULL)
+        char** newValues = (char**)malloc(newCap * sizeof(char*));
+        if (newValues == NULL)
         {
-            // rollback: shrink extraKeys back to old capacity
-            k = (char**)realloc(req->extraKeys,
-                                req->extraCap * sizeof(char*));
-            if (k != NULL)
-            {
-                req->extraKeys = k;
-            }
+            free(newKeys);
             return;
         }
-        req->extraValues = v;
+
+        for (size_t i = 0; i < req->extraCount; i++)
+        {
+            newKeys[i]   = req->extraKeys[i];
+            newValues[i] = req->extraValues[i];
+        }
+
+        free(req->extraKeys);
+        free(req->extraValues);
+        req->extraKeys   = newKeys;
+        req->extraValues = newValues;
         req->extraCap    = newCap;
     }
 
@@ -544,8 +640,35 @@ static int llmapiBuildRequestBody(const LlmmapiReq* req, int stream, LlmBuf* out
             cJSON_Delete(root);
             return -1;
         }
-        cJSON_AddStringToObject(item, "role",    msg->role);
-        cJSON_AddStringToObject(item, "content", msg->content);
+        cJSON_AddStringToObject(item, "role", msg->role);
+
+        if (msg->toolCallsJson)
+        {
+            cJSON* tcs = cJSON_Parse(msg->toolCallsJson);
+            if (tcs)
+            {
+                cJSON_AddItemToObject(item, "tool_calls", tcs);
+                cJSON_AddNullToObject(item, "content");
+            }
+            else
+            {
+                cJSON_AddStringToObject(item, "content", "");
+            }
+        }
+        else if (msg->toolCallId)
+        {
+            cJSON_AddStringToObject(item, "tool_call_id", msg->toolCallId);
+            if (msg->toolCallName)
+            {
+                cJSON_AddStringToObject(item, "name", msg->toolCallName);
+            }
+            cJSON_AddStringToObject(item, "content", msg->content);
+        }
+        else
+        {
+            cJSON_AddStringToObject(item, "content", msg->content);
+        }
+
         cJSON_AddItemToArray(msgs, item);
     }
 
@@ -998,6 +1121,11 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
     llmBufFree(&bodyBuf);
     llmBufFree(&urlBuf);
     llmBufSecureFree(&authBuf);
+
+    if (sctx.lineBuf.len > 0)
+    {
+        llmProcessSseLine(&sctx, sctx.lineBuf.data, sctx.lineBuf.len);
+    }
     llmBufFree(&sctx.lineBuf);
 
     if (res != CURLE_OK)

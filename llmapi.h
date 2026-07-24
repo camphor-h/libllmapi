@@ -37,6 +37,11 @@ extern "C"
 #include <stddef.h>
 
 // ==================== Lifecycle ====================
+//
+// NOTE: llmapiInit() / llmapiCleanup() are not thread-safe with respect to
+// each other.  Serialise all init/cleanup calls (e.g. do them in the main
+// thread before spawning workers).  Once a context is created, using it from
+// multiple threads concurrently IS safe.
 
 typedef struct LlmmapiCtx LlmmapiCtx;
 
@@ -66,9 +71,16 @@ typedef struct LlmmapiReq LlmmapiReq;
 LlmmapiReq* llmapiReqNew(const char* model);
 void        llmapiReqFree(LlmmapiReq* req);
 
-// Add a message to the request.  role is "system", "user", or "assistant".
+// Add a message to the request.  role is "system", "user", "assistant", or "tool".
 // The role and content strings are copied internally.
 void llmapiReqAddMsg(LlmmapiReq* req, const char* role, const char* content);
+
+// Add an assistant message with tool_calls (content is null).
+// toolCallsJson must be a valid JSON array of tool call objects.
+void llmapiReqAddAssistantToolCalls(LlmmapiReq* req, const char* toolCallsJson);
+
+// Add a tool result message (role="tool") with a tool_call_id.
+void llmapiReqAddToolResult(LlmmapiReq* req, const char* toolCallId, const char* name, const char* content);
 
 void llmapiReqSetMaxTokens(LlmmapiReq* req, size_t maxTokens);
 void llmapiReqSetTemperature(LlmmapiReq* req, double temp);

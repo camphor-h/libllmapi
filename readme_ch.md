@@ -77,6 +77,28 @@ llmapiReqAddMsg(req, LLMAPI_ROLE_USER, "下一个问题");
 resp = llmapiChatComplete(ctx, url, key, req);       // 带完整历史
 ```
 
+### 工具调用（Tool Calling）
+
+```c
+// 提出需要工具的请求
+llmapiReqAddMsg(req, LLMAPI_ROLE_USER, "巴黎今天天气如何？");
+char* resp = llmapiChatComplete(ctx, url, key, req);
+
+// 解析工具调用请求
+char* tcJson = llmapiRespGetToolCallsJson(resp, 0);
+free(resp);
+
+// 追加 assistant 的 tool_calls 消息
+llmapiReqAddAssistantToolCalls(req, tcJson);
+
+// 执行工具并追加结果
+llmapiReqAddToolResult(req, "call_123", "get_weather", "晴朗，22°C");
+
+// 继续对话
+resp = llmapiChatComplete(ctx, url, key, req);
+char* answer = llmapiRespGetContent(resp, 0);
+```
+
 ### 额外参数
 
 ```c
@@ -101,7 +123,9 @@ llmapiReqSet(req, "seed",             "42");
 | 函数 | 说明 |
 |------|------|
 | `llmapiReqNew(model)` / `llmapiReqFree(req)` | 请求生命周期 |
-| `llmapiReqAddMsg(req, role, content)` | 添加消息 |
+| `llmapiReqAddMsg(req, role, content)` | 添加消息 (role: system/user/assistant/tool) |
+| `llmapiReqAddAssistantToolCalls(req, json)` | 添加带 tool_calls 的 assistant 消息 |
+| `llmapiReqAddToolResult(req, id, name, content)` | 添加工具执行结果消息 |
 | `llmapiReqSetMaxTokens(req, n)` | 设置 max_tokens |
 | `llmapiReqSetTemperature(req, t)` | 设置 temperature |
 | `llmapiReqSet(req, key, jsonValue)` | 通用参数 |

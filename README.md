@@ -76,6 +76,28 @@ llmapiReqAddMsg(req, LLMAPI_ROLE_USER, "next question");
 resp = llmapiChatComplete(ctx, url, key, req);       // full history sent
 ```
 
+### Tool Calling
+
+```c
+// Ask a question that needs a tool
+llmapiReqAddMsg(req, LLMAPI_ROLE_USER, "What's the weather in Paris?");
+char* resp = llmapiChatComplete(ctx, url, key, req);
+
+// Read the tool call request
+char* tcJson = llmapiRespGetToolCallsJson(resp, 0);
+free(resp);
+
+// Append assistant tool_calls message
+llmapiReqAddAssistantToolCalls(req, tcJson);
+
+// Execute the tool and append result
+llmapiReqAddToolResult(req, "call_123", "get_weather", "Sunny, 22°C");
+
+// Continue
+resp = llmapiChatComplete(ctx, url, key, req);
+char* answer = llmapiRespGetContent(resp, 0);
+```
+
 ### Extra Parameters
 
 ```c
@@ -100,7 +122,9 @@ llmapiReqSet(req, "seed",             "42");
 | Function | Description |
 |----------|-------------|
 | `llmapiReqNew(model)` / `llmapiReqFree(req)` | Request lifecycle |
-| `llmapiReqAddMsg(req, role, content)` | Add a message |
+| `llmapiReqAddMsg(req, role, content)` | Add a message (role: system/user/assistant/tool) |
+| `llmapiReqAddAssistantToolCalls(req, json)` | Add assistant message with tool_calls |
+| `llmapiReqAddToolResult(req, id, name, content)` | Add tool result message |
 | `llmapiReqSetMaxTokens(req, n)` | Set max_tokens |
 | `llmapiReqSetTemperature(req, t)` | Set temperature |
 | `llmapiReqSet(req, key, jsonValue)` | Generic parameter |
