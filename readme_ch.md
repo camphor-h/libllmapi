@@ -136,6 +136,7 @@ llmapiReqSet(req, "seed",             "42");
 |------|------|
 | `llmapiChatComplete(ctx, url, key, req)` | 普通调用，返回 JSON 字符串 |
 | `llmapiChatCompleteStream(ctx, url, key, req, cb, ud)` | 流式调用，类型感知回调 |
+| `llmapiStreamGetUsage(ctx, &total, &prompt, &comp)` | 获取上一次流式调用的 token 用量 |
 
 ### 响应提取
 

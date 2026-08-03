@@ -135,6 +135,7 @@ llmapiReqSet(req, "seed",             "42");
 |----------|-------------|
 | `llmapiChatComplete(ctx, url, key, req)` | Sync (returns JSON string) |
 | `llmapiChatCompleteStream(ctx, url, key, req, cb, ud)` | Streaming with type-aware callback |
+| `llmapiStreamGetUsage(ctx, &total, &prompt, &comp)` | Token usage from last streaming call |
 
 ### Response Helpers
 

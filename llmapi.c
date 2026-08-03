@@ -209,6 +209,10 @@ struct LlmmapiCtx
 {
     LlmBuf errbuf;
     char*  caPath;
+
+    int lastTotalTokens;
+    int lastPromptTokens;
+    int lastCompletionTokens;
 };
 
 // ==================== Internal: Validation ====================
@@ -290,7 +294,10 @@ LlmmapiCtx* llmapiInit(void)
     llmapiGlobalRefs++;
 
     llmBufInit(&ctx->errbuf);
-    ctx->caPath = NULL;
+    ctx->caPath               = NULL;
+    ctx->lastTotalTokens      = 0;
+    ctx->lastPromptTokens     = 0;
+    ctx->lastCompletionTokens = 0;
 
     return ctx;
 }
@@ -903,6 +910,9 @@ struct LlmStreamCtx
     LlmmapiStreamCb  cb;
     void*            userdata;
     int              done;
+    int              usageTotal;
+    int              usagePrompt;
+    int              usageCompletion;
 };
 
 static void llmProcessSseLine(struct LlmStreamCtx* sctx, const char* line,
@@ -993,6 +1003,28 @@ static void llmProcessSseLine(struct LlmStreamCtx* sctx, const char* line,
         {
             sctx->done = 1;
             sctx->cb(LLMAPI_STREAM_TEXT, NULL, 1, sctx->userdata);
+        }
+    }
+
+    // Some providers send token usage in the final SSE chunk.  Capture it so
+    // callers can report context usage after a streaming call completes.
+    cJSON* usage = cJSON_GetObjectItem(root, "usage");
+    if (usage != NULL && cJSON_IsObject(usage))
+    {
+        cJSON* item = cJSON_GetObjectItem(usage, "total_tokens");
+        if (item != NULL && cJSON_IsNumber(item))
+        {
+            sctx->usageTotal = (int)item->valuedouble;
+        }
+        item = cJSON_GetObjectItem(usage, "prompt_tokens");
+        if (item != NULL && cJSON_IsNumber(item))
+        {
+            sctx->usagePrompt = (int)item->valuedouble;
+        }
+        item = cJSON_GetObjectItem(usage, "completion_tokens");
+        if (item != NULL && cJSON_IsNumber(item))
+        {
+            sctx->usageCompletion = (int)item->valuedouble;
         }
     }
 
@@ -1107,6 +1139,9 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
     sctx.cb       = cb;
     sctx.userdata = userdata;
     sctx.done     = 0;
+    sctx.usageTotal      = 0;
+    sctx.usagePrompt     = 0;
+    sctx.usageCompletion = 0;
 
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, llmStreamWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &sctx);
@@ -1127,6 +1162,10 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
         llmProcessSseLine(&sctx, sctx.lineBuf.data, sctx.lineBuf.len);
     }
     llmBufFree(&sctx.lineBuf);
+
+    ctx->lastTotalTokens      = sctx.usageTotal;
+    ctx->lastPromptTokens     = sctx.usagePrompt;
+    ctx->lastCompletionTokens = sctx.usageCompletion;
 
     if (res != CURLE_OK)
     {
@@ -1153,6 +1192,25 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
     }
 
     return 0;
+}
+
+// Retrieve the token usage captured from the last streaming response.
+// Fields are set to 0 when no usage was reported by the provider.
+void llmapiStreamGetUsage(LlmmapiCtx* ctx,
+                          int* total,
+                          int* prompt,
+                          int* completion)
+{
+    if (ctx == NULL)
+    {
+        if (total)      *total = 0;
+        if (prompt)     *prompt = 0;
+        if (completion) *completion = 0;
+        return;
+    }
+    if (total)      *total      = ctx->lastTotalTokens;
+    if (prompt)     *prompt     = ctx->lastPromptTokens;
+    if (completion) *completion = ctx->lastCompletionTokens;
 }
 
 // ==================== Response Helpers ====================

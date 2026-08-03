@@ -131,6 +131,13 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
                               LlmmapiStreamCb cb,
                               void* userdata);
 
+// Retrieve the token usage captured from the last streaming response.
+// Fields are set to 0 when the provider reported no usage.
+void llmapiStreamGetUsage(LlmmapiCtx* ctx,
+                          int* total,
+                          int* prompt,
+                          int* completion);
+
 // ==================== Response Helpers ====================
 
 // Extract text content from choices[idx].message.content.
