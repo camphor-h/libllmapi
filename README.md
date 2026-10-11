@@ -1,25 +1,52 @@
 # libllmapi
 
-A C99 library for calling LLM APIs (OpenAI-compatible) using **libcurl** and **cjson**.
+A C99 library for calling LLM APIs (OpenAI-compatible) using **cjson**.
+
+The HTTP(S) transport is **not built in** — you inject one, so the library works
+with any HTTP/TLS stack (libcurl, WinHTTP, esp_http_client, a mock, ...).
 
 ## Dependencies
 
-- [libcurl](https://curl.se/libcurl/)
 - [cjson](https://github.com/DaveGamble/cJSON)
 
 ## Build
 
 ```sh
 cc -std=c99 -c llmapi.c -o llmapi.o
-cc -std=c99 your_program.c llmapi.o -lcurl -lcjson -o your_program
+cc -std=c99 your_program.c llmapi.o -lcjson -o your_program
 ```
 
 ## Usage
+
+### Transport (required)
+
+libllmapi performs no network I/O itself. Implement a transport and inject it
+before making any call:
+
+```c
+static int myPerform(void* ud, const LlmmapiHttpRequest* req,
+                     LlmmapiWriteFn onChunk, void* cud,
+                     LlmmapiHttpResult* res)
+{
+    // e.g. drive libcurl / WinHTTP / esp_http_client here.
+    // For each chunk of the response body: onChunk(data, len, cud);
+    // Then set:
+    res->status = 200;   // HTTP status code
+    res->error  = NULL;  // non-NULL string on transport failure
+    return 0;            // 0 on a completed round-trip, non-zero on error
+}
+
+LlmmapiTransport t = { myPerform, NULL, NULL }; // perform, destroy, userdata
+llmapiSetTransport(ctx, &t);
+```
 
 ### Sync Chat
 
 ```c
 LlmmapiCtx* ctx = llmapiInit();
+
+LlmmapiTransport t = { myPerform, NULL, NULL };
+llmapiSetTransport(ctx, &t);
 
 LlmmapiReq* req = llmapiReqNew("gpt-4");
 llmapiReqAddMsg(req, LLMAPI_ROLE_SYSTEM, "You are a helpful assistant.");
@@ -109,13 +136,21 @@ llmapiReqSet(req, "seed",             "42");
 
 ## API
 
-### Lifecycle / Error / Config
+### Lifecycle / Error
 
 | Function | Description |
 |----------|-------------|
 | `llmapiInit()` / `llmapiCleanup()` | Lifecycle |
 | `llmapiStrError(ctx)` | Last error message |
-| `llmapiSetCaPath(ctx, path)` | Set custom CA bundle (NULL = default) |
+
+### Transport
+
+| Function | Description |
+|----------|-------------|
+| `llmapiSetTransport(ctx, &t)` | Inject the HTTP transport (required before any call) |
+| `LlmmapiTransport` | `{ perform, destroy, userdata }` callback struct |
+| `LlmmapiHttpRequest` / `LlmmapiHttpResult` | Request passed in / result filled out by the transport |
+| `LlmmapiWriteFn` | Chunk callback for response body bytes |
 
 ### Request
 

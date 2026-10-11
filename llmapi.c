@@ -1,6 +1,8 @@
 // llmapi.c -- Implementation of libllmapi
 //
-// A C99 library for calling LLM APIs (OpenAI-compatible) using libcurl and cjson.
+// A C99 library for calling LLM APIs (OpenAI-compatible).
+//
+// The HTTP(S) transport is injected by the caller (see llmapiSetTransport).
 //
 // Copyright (c) 2025, libllmapi contributors
 // All rights reserved.
@@ -32,8 +34,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdint.h>
 
-#include <curl/curl.h>
 #include <cjson/cJSON.h>
 
 // ==================== Internal Constants ====================
@@ -42,8 +44,6 @@
 #define LLMAPI_LINE_MAX  (64 * 1024)          // 64 KB max per SSE line
 
 // ==================== Internal Static State ====================
-
-static int llmapiGlobalRefs = 0;
 
 // ==================== Internal Dynamic Buffer ====================
 
@@ -208,7 +208,9 @@ struct LlmmapiReq
 struct LlmmapiCtx
 {
     LlmBuf errbuf;
-    char*  caPath;
+
+    int               hasTransport;
+    LlmmapiTransport  transport;
 
     int lastTotalTokens;
     int lastPromptTokens;
@@ -287,14 +289,11 @@ LlmmapiCtx* llmapiInit(void)
         return NULL;
     }
 
-    if (llmapiGlobalRefs == 0)
-    {
-        curl_global_init(CURL_GLOBAL_ALL);
-    }
-    llmapiGlobalRefs++;
-
     llmBufInit(&ctx->errbuf);
-    ctx->caPath               = NULL;
+
+    ctx->hasTransport = 0;
+    memset(&ctx->transport, 0, sizeof(ctx->transport));
+
     ctx->lastTotalTokens      = 0;
     ctx->lastPromptTokens     = 0;
     ctx->lastCompletionTokens = 0;
@@ -309,15 +308,13 @@ void llmapiCleanup(LlmmapiCtx* ctx)
         return;
     }
 
-    llmBufFree(&ctx->errbuf);
-    free(ctx->caPath);
-    free(ctx);
-
-    llmapiGlobalRefs--;
-    if (llmapiGlobalRefs == 0)
+    if (ctx->hasTransport && ctx->transport.destroy)
     {
-        curl_global_cleanup();
+        ctx->transport.destroy(ctx->transport.userdata);
     }
+
+    llmBufFree(&ctx->errbuf);
+    free(ctx);
 }
 
 // ==================== Error ====================
@@ -332,26 +329,24 @@ const char* llmapiStrError(LlmmapiCtx* ctx)
     return ctx->errbuf.data ? ctx->errbuf.data : "";
 }
 
-// ==================== Configuration ====================
+// ==================== Transport ====================
 
-void llmapiSetCaPath(LlmmapiCtx* ctx, const char* caPath)
+void llmapiSetTransport(LlmmapiCtx* ctx, const LlmmapiTransport* transport)
 {
     if (ctx == NULL)
     {
         return;
     }
 
-    free(ctx->caPath);
-    ctx->caPath = NULL;
-
-    if (caPath != NULL)
+    if (transport == NULL || transport->perform == NULL)
     {
-        ctx->caPath = (char*)malloc(strlen(caPath) + 1);
-        if (ctx->caPath)
-        {
-            strcpy(ctx->caPath, caPath);
-        }
+        ctx->hasTransport = 0;
+        memset(&ctx->transport, 0, sizeof(ctx->transport));
+        return;
     }
+
+    ctx->transport    = *transport;
+    ctx->hasTransport = 1;
 }
 
 // ==================== Request ====================
@@ -719,104 +714,77 @@ static int llmapiBuildRequestBody(const LlmmapiReq* req, int stream, LlmBuf* out
     return ok;
 }
 
-// ==================== Internal: libcurl Write Callback ====================
+// ==================== Internal: Chunk Collector ====================
 
-struct LlmWriteCtx
+// Append every received chunk to a buffer (used by the sync path).
+static int llmCollectChunk(const void* data, size_t len, void* userdata)
 {
-    LlmBuf* buf;
-};
+    LlmBuf* buf = (LlmBuf*)userdata;
 
-static size_t llmWriteCallback(char* ptr,
-                                size_t size,
-                                size_t nmemb,
-                                void* userdata)
-{
-    size_t total = size * nmemb;
-    struct LlmWriteCtx* wctx = (struct LlmWriteCtx*)userdata;
-
-    if (llmBufGrow(wctx->buf, wctx->buf->len + total + 1) != 0)
+    if (llmBufGrow(buf, buf->len + len + 1) != 0)
     {
         return 0;
     }
 
-    memcpy(wctx->buf->data + wctx->buf->len, ptr, total);
-    wctx->buf->len += total;
-    wctx->buf->data[wctx->buf->len] = '\0';
+    if (len > 0)
+    {
+        memcpy(buf->data + buf->len, data, len);
+        buf->len += len;
+    }
+    buf->data[buf->len] = '\0';
 
-    return total;
+    return 1;
 }
 
-// ==================== Internal: Common HTTP Setup ====================
+// ==================== Internal: Request Assembly ====================
 
-static CURL* llmapiSetupCurl(LlmmapiCtx* ctx,
+// Fill urlBuf, authBuf and the NULL-terminated header array.  `headers`
+// must have room for at least 4 entries.  Returns 0 on success, -1 on
+// failure (with a message appended to ctx->errbuf).
+static int llmapiBuildRequest(LlmmapiCtx* ctx,
                                const char* baseUrl,
                                const char* apiKey,
-                               const char* body,
-                               size_t bodyLen,
                                int stream,
-                               struct curl_slist** outHeaders,
-                               LlmBuf* outUrlBuf,
-                               LlmBuf* outAuthBuf)
+                               LlmBuf* urlBuf,
+                               LlmBuf* authBuf,
+                               const char** headers)
 {
     if (llmapiHasCrlf(baseUrl))
     {
         llmBufAppend(&ctx->errbuf, "baseUrl contains invalid characters");
-        return NULL;
+        return -1;
     }
 
     if (llmapiHasCrlf(apiKey))
     {
         llmBufAppend(&ctx->errbuf, "apiKey contains invalid characters");
-        return NULL;
+        return -1;
     }
 
-    llmBufAppend(outUrlBuf, baseUrl);
-    size_t baseLen = outUrlBuf->len;
-    if (baseLen > 0 && outUrlBuf->data[baseLen - 1] != '/')
+    llmBufAppend(urlBuf, baseUrl);
+    size_t baseLen = urlBuf->len;
+    if (baseLen > 0 && urlBuf->data[baseLen - 1] != '/')
     {
-        llmBufAppend(outUrlBuf, "/chat/completions");
+        llmBufAppend(urlBuf, "/chat/completions");
     }
     else
     {
-        llmBufAppend(outUrlBuf, "chat/completions");
+        llmBufAppend(urlBuf, "chat/completions");
     }
 
-    llmBufAppend(outAuthBuf, "Authorization: Bearer ");
-    llmBufAppend(outAuthBuf, apiKey);
+    llmBufAppend(authBuf, "Authorization: Bearer ");
+    llmBufAppend(authBuf, apiKey);
 
-    struct curl_slist* headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
+    size_t n = 0;
+    headers[n++] = "Content-Type: application/json";
     if (stream)
     {
-        headers = curl_slist_append(headers, "Accept: text/event-stream");
+        headers[n++] = "Accept: text/event-stream";
     }
-    headers = curl_slist_append(headers, outAuthBuf->data);
+    headers[n++] = authBuf->data;
+    headers[n]   = NULL;
 
-    *outHeaders = headers;
-
-    CURL* curl = curl_easy_init();
-    if (curl == NULL)
-    {
-        llmBufAppend(&ctx->errbuf, "curl_easy_init failed");
-        curl_slist_free_all(headers);
-        return NULL;
-    }
-
-    curl_easy_setopt(curl, CURLOPT_URL,               outUrlBuf->data);
-    curl_easy_setopt(curl, CURLOPT_POST,               1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS,         body);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,      (long)bodyLen);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER,         headers);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT,            120L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER,     1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST,     2L);
-
-    if (ctx->caPath)
-    {
-        curl_easy_setopt(curl, CURLOPT_CAINFO, ctx->caPath);
-    }
-
-    return curl;
+    return 0;
 }
 
 // ==================== Sync Chat ====================
@@ -834,6 +802,13 @@ char* llmapiChatComplete(LlmmapiCtx* ctx,
     llmBufFree(&ctx->errbuf);
     llmBufInit(&ctx->errbuf);
 
+    if (!ctx->hasTransport)
+    {
+        llmBufAppend(&ctx->errbuf,
+                     "no transport set (call llmapiSetTransport)");
+        return NULL;
+    }
+
     LlmBuf bodyBuf;
     llmBufInit(&bodyBuf);
 
@@ -849,11 +824,9 @@ char* llmapiChatComplete(LlmmapiCtx* ctx,
     llmBufInit(&urlBuf);
     llmBufInit(&authBuf);
 
-    struct curl_slist* headers = NULL;
-    CURL* curl = llmapiSetupCurl(ctx, baseUrl, apiKey,
-                                  bodyBuf.data, bodyBuf.len,
-                                  0, &headers, &urlBuf, &authBuf);
-    if (curl == NULL)
+    const char* headers[4];
+    if (llmapiBuildRequest(ctx, baseUrl, apiKey, 0,
+                           &urlBuf, &authBuf, headers) != 0)
     {
         llmBufFree(&bodyBuf);
         llmBufFree(&urlBuf);
@@ -861,38 +834,42 @@ char* llmapiChatComplete(LlmmapiCtx* ctx,
         return NULL;
     }
 
+    LlmmapiHttpRequest httpReq;
+    httpReq.method    = "POST";
+    httpReq.url       = urlBuf.data;
+    httpReq.headers   = headers;
+    httpReq.body      = bodyBuf.data;
+    httpReq.bodyLen   = bodyBuf.len;
+    httpReq.timeoutMs = 120000L;
+
     LlmBuf respBuf;
     llmBufInit(&respBuf);
 
-    struct LlmWriteCtx wctx;
-    wctx.buf = &respBuf;
+    LlmmapiHttpResult result;
+    result.status = 0;
+    result.error  = NULL;
 
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, llmWriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &wctx);
+    int rc = ctx->transport.perform(ctx->transport.userdata, &httpReq,
+                                    llmCollectChunk, &respBuf, &result);
 
-    CURLcode res = curl_easy_perform(curl);
-
-    long httpCode = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
     llmBufFree(&bodyBuf);
     llmBufFree(&urlBuf);
     llmBufSecureFree(&authBuf);
 
-    if (res != CURLE_OK)
+    if (rc != 0 || (result.error != NULL && result.error[0] != '\0'))
     {
-        llmBufAppend(&ctx->errbuf, curl_easy_strerror(res));
+        llmBufAppend(&ctx->errbuf,
+                     (result.error != NULL) ? result.error
+                                            : "transport error");
         llmBufFree(&respBuf);
         return NULL;
     }
 
-    if (httpCode < 200 || httpCode >= 300)
+    if (result.status < 200 || result.status >= 300)
     {
         llmBufAppendFmt(&ctx->errbuf,
                         "HTTP %ld: %s",
-                        httpCode,
+                        result.status,
                         respBuf.data ? respBuf.data : "");
         llmBufFree(&respBuf);
         return NULL;
@@ -1031,13 +1008,12 @@ static void llmProcessSseLine(struct LlmStreamCtx* sctx, const char* line,
     cJSON_Delete(root);
 }
 
-static size_t llmStreamWriteCallback(char* ptr,
-                                      size_t size,
-                                      size_t nmemb,
-                                      void* userdata)
+static int llmStreamWriteCallback(const void* data,
+                                   size_t total,
+                                   void* userdata)
 {
-    size_t total = size * nmemb;
     struct LlmStreamCtx* sctx = (struct LlmStreamCtx*)userdata;
+    const char* ptr = (const char*)data;
 
     if (llmBufGrow(&sctx->rawBuf, sctx->rawBuf.len + total + 1) != 0)
     {
@@ -1085,7 +1061,7 @@ static size_t llmStreamWriteCallback(char* ptr,
         }
     }
 
-    return total;
+    return 1;
 }
 
 // ==================== Streaming Chat ====================
@@ -1106,6 +1082,13 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
     llmBufFree(&ctx->errbuf);
     llmBufInit(&ctx->errbuf);
 
+    if (!ctx->hasTransport)
+    {
+        llmBufAppend(&ctx->errbuf,
+                     "no transport set (call llmapiSetTransport)");
+        return -1;
+    }
+
     LlmBuf bodyBuf;
     llmBufInit(&bodyBuf);
 
@@ -1121,11 +1104,9 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
     llmBufInit(&urlBuf);
     llmBufInit(&authBuf);
 
-    struct curl_slist* headers = NULL;
-    CURL* curl = llmapiSetupCurl(ctx, baseUrl, apiKey,
-                                  bodyBuf.data, bodyBuf.len,
-                                  1, &headers, &urlBuf, &authBuf);
-    if (curl == NULL)
+    const char* headers[4];
+    if (llmapiBuildRequest(ctx, baseUrl, apiKey, 1,
+                           &urlBuf, &authBuf, headers) != 0)
     {
         llmBufFree(&bodyBuf);
         llmBufFree(&urlBuf);
@@ -1143,16 +1124,21 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
     sctx.usagePrompt     = 0;
     sctx.usageCompletion = 0;
 
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, llmStreamWriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &sctx);
+    LlmmapiHttpRequest httpReq;
+    httpReq.method    = "POST";
+    httpReq.url       = urlBuf.data;
+    httpReq.headers   = headers;
+    httpReq.body      = bodyBuf.data;
+    httpReq.bodyLen   = bodyBuf.len;
+    httpReq.timeoutMs = 120000L;
 
-    CURLcode res = curl_easy_perform(curl);
+    LlmmapiHttpResult result;
+    result.status = 0;
+    result.error  = NULL;
 
-    long httpCode = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+    int rc = ctx->transport.perform(ctx->transport.userdata, &httpReq,
+                                    llmStreamWriteCallback, &sctx, &result);
 
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
     llmBufFree(&bodyBuf);
     llmBufFree(&urlBuf);
     llmBufSecureFree(&authBuf);
@@ -1167,18 +1153,20 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
     ctx->lastPromptTokens     = sctx.usagePrompt;
     ctx->lastCompletionTokens = sctx.usageCompletion;
 
-    if (res != CURLE_OK)
+    if (rc != 0 || (result.error != NULL && result.error[0] != '\0'))
     {
-        llmBufAppend(&ctx->errbuf, curl_easy_strerror(res));
+        llmBufAppend(&ctx->errbuf,
+                     (result.error != NULL) ? result.error
+                                            : "transport error");
         llmBufFree(&sctx.rawBuf);
         return -1;
     }
 
-    if (httpCode < 200 || httpCode >= 300)
+    if (result.status < 200 || result.status >= 300)
     {
         llmBufAppendFmt(&ctx->errbuf,
                         "HTTP %ld: %s",
-                        httpCode,
+                        result.status,
                         sctx.rawBuf.data ? sctx.rawBuf.data : "");
         llmBufFree(&sctx.rawBuf);
         return -1;

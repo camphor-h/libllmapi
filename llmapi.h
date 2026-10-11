@@ -1,6 +1,9 @@
 // llmapi.h -- Public API for libllmapi
 //
-// A C99 library for calling LLM APIs (OpenAI-compatible) using libcurl and cjson.
+// A C99 library for calling LLM APIs (OpenAI-compatible).
+//
+// The HTTP(S) transport is not built in: you inject one via llmapiSetTransport().
+// JSON is handled with cjson.
 //
 // Copyright (c) 2025, libllmapi contributors
 // All rights reserved.
@@ -52,11 +55,61 @@ void        llmapiCleanup(LlmmapiCtx* ctx);
 
 const char* llmapiStrError(LlmmapiCtx* ctx);
 
-// ==================== Configuration ====================
+// ==================== Transport ====================
+//
+// libllmapi does not perform any network I/O itself.  You must inject a
+// transport that does the actual HTTP(S) request.  This keeps the library
+// independent of any particular HTTP/TLS stack (libcurl, WinHTTP,
+// esp_http_client, a raw socket, a mock, ...).
 
-// Set custom CA bundle path for TLS verification.
-// Pass NULL to use the default system CA path.
-void llmapiSetCaPath(LlmmapiCtx* ctx, const char* caPath);
+// Callback invoked by the transport for each chunk of the response body.
+// Return non-zero to continue, or 0 to abort the transfer.
+typedef int (*LlmmapiWriteFn)(const void* data, size_t len, void* userdata);
+
+// A fully-formed HTTP request handed to the transport.
+typedef struct
+{
+    const char*        method;    // always "POST"
+    const char*        url;       // baseUrl + "/chat/completions"
+    const char* const* headers;   // NULL-terminated list:
+                                  //   "Content-Type: application/json"
+                                  //   "Accept: text/event-stream" (streaming only)
+                                  //   "Authorization: Bearer <apiKey>"
+    const void*        body;      // serialized JSON request body
+    size_t             bodyLen;
+    long               timeoutMs; // suggested timeout; transport may ignore
+} LlmmapiHttpRequest;
+
+// Filled in by the transport.
+typedef struct
+{
+    long        status; // HTTP status code (required on success)
+    const char* error;  // non-NULL on transport failure; may be static storage
+} LlmmapiHttpResult;
+
+typedef struct LlmmapiTransport
+{
+    // Perform the request.  Response body bytes are delivered through onChunk.
+    // Return 0 when the round-trip completed (regardless of HTTP status),
+    // or non-zero on a transport-level failure (set result->error).
+    int (*perform)(void* userdata,
+                   const LlmmapiHttpRequest* request,
+                   LlmmapiWriteFn onChunk,
+                   void* chunkUserdata,
+                   LlmmapiHttpResult* result);
+
+    // Optional.  Invoked once from llmapiCleanup() for the currently
+    // injected transport.  Replacing a transport does not call this.
+    void (*destroy)(void* userdata);
+
+    void* userdata;
+} LlmmapiTransport;
+
+// Inject the transport used by this context.  The struct is copied, so
+// `transport` only needs to remain valid for the duration of this call
+// (its userdata pointer is not owned by the library).  Pass NULL to detach.
+// Without a transport, every chat call fails with an error.
+void llmapiSetTransport(LlmmapiCtx* ctx, const LlmmapiTransport* transport);
 
 // ==================== Role Macros ====================
 

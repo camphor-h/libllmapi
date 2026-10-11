@@ -1,27 +1,52 @@
 # libllmapi
 
-使用 **libcurl** + **cjson** 调用 OpenAI 兼容 LLM API 的 C99 库。
+使用 **cjson** 调用 OpenAI 兼容 LLM API 的 C99 库。
+
+HTTP(S) 传输层**不内置**，由调用方注入，因此不绑定任何 HTTP/TLS 实现（libcurl、WinHTTP、esp_http_client、mock 等）。
 
 支持普通文本、推理思考（thinking）、工具调用（tool calls）的同步/流式输出。
 
 ## 依赖
 
-- [libcurl](https://curl.se/libcurl/)
 - [cjson](https://github.com/DaveGamble/cJSON)
 
 ## 编译
 
 ```sh
 cc -std=c99 -c llmapi.c -o llmapi.o
-cc -std=c99 your_program.c llmapi.o -lcurl -lcjson -o your_program
+cc -std=c99 your_program.c llmapi.o -lcjson -o your_program
 ```
 
 ## 使用示例
+
+### 注入传输层（必需）
+
+库本身不做任何网络 I/O，发请求前必须先注入一个 transport：
+
+```c
+static int myPerform(void* ud, const LlmmapiHttpRequest* req,
+                     LlmmapiWriteFn onChunk, void* cud,
+                     LlmmapiHttpResult* res)
+{
+    // 在这里驱动 libcurl / WinHTTP / esp_http_client 等。
+    // 每收到一段响应体就调用：onChunk(data, len, cud);
+    // 然后回填：
+    res->status = 200;   // HTTP 状态码
+    res->error  = NULL;  // 传输失败时填错误串
+    return 0;            // 完整往返返回 0，失败返回非 0
+}
+
+LlmmapiTransport t = { myPerform, NULL, NULL }; // perform, destroy, userdata
+llmapiSetTransport(ctx, &t);
+```
 
 ### 普通调用
 
 ```c
 LlmmapiCtx* ctx = llmapiInit();
+
+LlmmapiTransport t = { myPerform, NULL, NULL };
+llmapiSetTransport(ctx, &t);
 
 LlmmapiReq* req = llmapiReqNew("gpt-4");
 llmapiReqAddMsg(req, LLMAPI_ROLE_SYSTEM, "你是一个有用的助手。");
@@ -110,13 +135,21 @@ llmapiReqSet(req, "seed",             "42");
 
 ## API 一览
 
-### 生命周期 / 错误 / 配置
+### 生命周期 / 错误
 
 | 函数 | 说明 |
 |------|------|
 | `llmapiInit()` / `llmapiCleanup()` | 生命周期 |
 | `llmapiStrError(ctx)` | 错误信息 |
-| `llmapiSetCaPath(ctx, path)` | 自定义 CA 证书路径 |
+
+### 传输层
+
+| 函数 | 说明 |
+|------|------|
+| `llmapiSetTransport(ctx, &t)` | 注入 HTTP 传输层（调用前必需） |
+| `LlmmapiTransport` | `{ perform, destroy, userdata }` 回调结构体 |
+| `LlmmapiHttpRequest` / `LlmmapiHttpResult` | 传给传输层的请求 / 由传输层回填的结果 |
+| `LlmmapiWriteFn` | 响应体分块回调 |
 
 ### 请求
 
