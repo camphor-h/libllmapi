@@ -423,7 +423,7 @@ void llmapiReqAddMsg(LlmmapiReq* req, const char* role, const char* content)
         return;
     }
 
-    if (llmapiHasCrlf(role) || llmapiHasCrlf(content))
+    if (llmapiHasCrlf(role))
     {
         return;
     }

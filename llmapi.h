@@ -41,10 +41,13 @@ extern "C"
 
 // ==================== Lifecycle ====================
 //
-// NOTE: llmapiInit() / llmapiCleanup() are not thread-safe with respect to
-// each other.  Serialise all init/cleanup calls (e.g. do them in the main
-// thread before spawning workers).  Once a context is created, using it from
-// multiple threads concurrently IS safe.
+// NOTE: a context is NOT safe to use concurrently from multiple threads.
+// It holds shared mutable state (the error buffer and the last token-usage
+// counters) that is written without locking.  Serialise calls per context, or
+// give each thread its own context.
+//
+// llmapiInit() / llmapiCleanup() additionally must not race with each other;
+// do them once, before spawning workers.
 
 typedef struct LlmmapiCtx LlmmapiCtx;
 

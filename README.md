@@ -40,6 +40,26 @@ LlmmapiTransport t = { myPerform, NULL, NULL }; // perform, destroy, userdata
 llmapiSetTransport(ctx, &t);
 ```
 
+### Message content
+
+`content` is free-form text. Newlines, tabs and non-ASCII characters (UTF-8) are
+all fine — the library JSON-escapes them for you, so a multi-line system prompt
+or a multi-line user message round-trips unchanged.
+
+Only values that end up in the **HTTP request line or headers** are validated
+against CRLF injection:
+
+| Value | Validated | Reason |
+|-------|-----------|--------|
+| `baseUrl` | yes | becomes the request line (after appending `/chat/completions`) |
+| `apiKey` | yes | becomes `Authorization: Bearer <key>` |
+| message `role` | yes | must be a plain token |
+| message `content` | **no** | goes into the JSON body, where newlines are legal |
+
+Invalid arguments are ignored **silently**: a NULL pointer, or a `role`
+containing CRLF, drops the message without setting an error. If a request comes
+back with fewer messages than you added, check the roles first.
+
 ### Sync Chat
 
 ```c
@@ -157,7 +177,7 @@ llmapiReqSet(req, "seed",             "42");
 | Function | Description |
 |----------|-------------|
 | `llmapiReqNew(model)` / `llmapiReqFree(req)` | Request lifecycle |
-| `llmapiReqAddMsg(req, role, content)` | Add a message (role: system/user/assistant/tool) |
+| `llmapiReqAddMsg(req, role, content)` | Add a message (role: system/user/assistant/tool); `content` may be multi-line |
 | `llmapiReqAddAssistantToolCalls(req, json)` | Add assistant message with tool_calls |
 | `llmapiReqAddToolResult(req, id, name, content)` | Add tool result message |
 | `llmapiReqSetMaxTokens(req, n)` | Set max_tokens |
