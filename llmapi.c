@@ -915,17 +915,9 @@ static void llmProcessSseLine(struct LlmStreamCtx* sctx, const char* line,
         return;
     }
 
-    char* jsonStr = (char*)malloc(payloadLen + 1);
-    if (jsonStr == NULL)
-    {
-        return;
-    }
-
-    memcpy(jsonStr, payload, payloadLen);
-    jsonStr[payloadLen] = '\0';
-
-    cJSON* root = cJSON_Parse(jsonStr);
-    free(jsonStr);
+    // `payload` is already NUL-terminated by the line buffer (see
+    // llmStreamWriteCallback), so it can be parsed in place.
+    cJSON* root = cJSON_Parse(payload);
 
     if (root == NULL)
     {
