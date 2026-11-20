@@ -150,6 +150,39 @@ llmapiReqSet(req, "stop",             "[\"END\"]");
 llmapiReqSet(req, "seed",             "42");
 ```
 
+### 多模态输入（原始 content parts）
+
+`llmapiReqAddMsgJson` 直接把 `content` 当成原始 JSON。库**不读文件、不做 base64**，
+数组由调用方自己拼（base64 在你的应用层完成）：
+
+```c
+// data: URL 由调用方生成（base64 在库外完成）
+const char* parts =
+    "[{\"type\":\"text\",\"text\":\"图里是什么？\"},"
+    " {\"type\":\"image_url\","
+    "  \"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KG...\"}}]";
+
+llmapiReqAddMsgJson(req, LLMAPI_ROLE_USER, parts);
+char* resp = llmapiChatComplete(ctx, url, key, req);
+```
+
+纯文本文件无需特殊处理——读成字符串后用 `llmapiReqAddMsg` 发即可（支持多行）。
+
+### 原始请求
+
+`llmapiRequest` 通过注入的 transport 发送任意字节，只额外设置
+`Content-Type`（给了才设）和 `Authorization: Bearer <apiKey>`（apiKey 非 NULL 时）：
+
+```c
+// 例如：调用方自己拼好的 multipart 上传到 Files API
+char* resp = llmapiRequest(ctx, "https://api.openai.com/v1", "sk-...",
+                           "POST", "/files",
+                           "multipart/form-data; boundary=----xyz",
+                           multipartBody, multipartLen);
+```
+
+> 该函数会把整个响应缓冲下来；聊天场景优先用上层接口。
+
 ## API 一览
 
 ### 生命周期 / 错误
@@ -174,6 +207,7 @@ llmapiReqSet(req, "seed",             "42");
 |------|------|
 | `llmapiReqNew(model)` / `llmapiReqFree(req)` | 请求生命周期 |
 | `llmapiReqAddMsg(req, role, content)` | 添加消息 (role: system/user/assistant/tool)，content 可多行 |
+| `llmapiReqAddMsgJson(req, role, json)` | 添加 content 为原始 JSON parts 的消息（库不做编码） |
 | `llmapiReqAddAssistantToolCalls(req, json)` | 添加带 tool_calls 的 assistant 消息 |
 | `llmapiReqAddToolResult(req, id, name, content)` | 添加工具执行结果消息 |
 | `llmapiReqSetMaxTokens(req, n)` | 设置 max_tokens |
@@ -187,6 +221,12 @@ llmapiReqSet(req, "seed",             "42");
 | `llmapiChatComplete(ctx, url, key, req)` | 普通调用，返回 JSON 字符串 |
 | `llmapiChatCompleteStream(ctx, url, key, req, cb, ud)` | 流式调用，类型感知回调 |
 | `llmapiStreamGetUsage(ctx, &total, &prompt, &comp)` | 获取上一次流式调用的 token 用量 |
+
+### 原始请求
+
+| 函数 | 说明 |
+|------|------|
+| `llmapiRequest(ctx, url, key, method, path, contentType, body, len)` | 经 transport 发送任意字节，返回缓冲后的响应体 |
 
 ### 响应提取
 

@@ -181,6 +181,7 @@ typedef struct
 {
     char* role;
     char* content;
+    int   contentIsJson;  // 1 = content is a raw JSON value (content parts)
     char* toolCallsJson;  // JSON array string for assistant tool_calls
     char* toolCallId;      // for tool role messages
     char* toolCallName;    // tool function name (for display)
@@ -245,6 +246,7 @@ static LlmMsg llmMsgMake(const char* role, const char* content)
     LlmMsg msg;
     msg.role         = (char*)malloc(strlen(role) + 1);
     msg.content      = (char*)malloc(strlen(content) + 1);
+    msg.contentIsJson = 0;
     msg.toolCallsJson = NULL;
     msg.toolCallId   = NULL;
     msg.toolCallName = NULL;
@@ -452,6 +454,43 @@ void llmapiReqAddMsg(LlmmapiReq* req, const char* role, const char* content)
     req->msgs[req->msgCount++] = msg;
 }
 
+void llmapiReqAddMsgJson(LlmmapiReq* req, const char* role, const char* contentJson)
+{
+    if (req == NULL || role == NULL || contentJson == NULL)
+    {
+        return;
+    }
+
+    if (llmapiHasCrlf(role))
+    {
+        return;
+    }
+
+    if (req->msgCount >= req->msgCap)
+    {
+        size_t newCap = req->msgCap == 0 ? 4 : req->msgCap * 2;
+        LlmMsg* p = (LlmMsg*)realloc(req->msgs,
+                                     newCap * sizeof(LlmMsg));
+        if (p == NULL)
+        {
+            return;
+        }
+
+        req->msgs   = p;
+        req->msgCap = newCap;
+    }
+
+    LlmMsg msg = llmMsgMake(role, contentJson);
+    if (msg.role == NULL || msg.content == NULL)
+    {
+        llmMsgFree(&msg);
+        return;
+    }
+
+    msg.contentIsJson = 1;
+    req->msgs[req->msgCount++] = msg;
+}
+
 void llmapiReqAddAssistantToolCalls(LlmmapiReq* req, const char* toolCallsJson)
 {
     if (req == NULL || toolCallsJson == NULL)
@@ -474,6 +513,7 @@ void llmapiReqAddAssistantToolCalls(LlmmapiReq* req, const char* toolCallsJson)
     LlmMsg msg;
     msg.role         = (char*)malloc(strlen("assistant") + 1);
     msg.content      = (char*)malloc(1);
+    msg.contentIsJson = 0;
     msg.toolCallsJson = (char*)malloc(strlen(toolCallsJson) + 1);
     msg.toolCallId   = NULL;
     msg.toolCallName = NULL;
@@ -515,6 +555,7 @@ void llmapiReqAddToolResult(LlmmapiReq* req, const char* toolCallId, const char*
     LlmMsg msg;
     msg.role         = (char*)malloc(strlen("tool") + 1);
     msg.content      = (char*)malloc(strlen(content) + 1);
+    msg.contentIsJson = 0;
     msg.toolCallId   = (char*)malloc(strlen(toolCallId) + 1);
     msg.toolCallsJson = NULL;
     msg.toolCallName = name ? (char*)malloc(strlen(name) + 1) : NULL;
@@ -644,7 +685,19 @@ static int llmapiBuildRequestBody(const LlmmapiReq* req, int stream, LlmBuf* out
         }
         cJSON_AddStringToObject(item, "role", msg->role);
 
-        if (msg->toolCallsJson)
+        if (msg->contentIsJson)
+        {
+            cJSON* parts = cJSON_Parse(msg->content);
+            if (parts == NULL || !cJSON_IsArray(parts))
+            {
+                cJSON_Delete(parts);
+                cJSON_Delete(item);
+                cJSON_Delete(root);
+                return -1;
+            }
+            cJSON_AddItemToObject(item, "content", parts);
+        }
+        else if (msg->toolCallsJson)
         {
             cJSON* tcs = cJSON_Parse(msg->toolCallsJson);
             if (tcs)
@@ -738,6 +791,43 @@ static int llmCollectChunk(const void* data, size_t len, void* userdata)
 
 // ==================== Internal: Request Assembly ====================
 
+// Append `path` to `baseUrl`, avoiding a doubled '/' at the join.
+static int llmapiJoinUrl(LlmBuf* out, const char* baseUrl, const char* path)
+{
+    if (baseUrl == NULL || path == NULL)
+    {
+        return -1;
+    }
+
+    if (llmBufAppend(out, baseUrl) != 0)
+    {
+        return -1;
+    }
+
+    if (path[0] == '\0' || out->len == 0)
+    {
+        return llmBufAppend(out, path);
+    }
+
+    int baseSlash = (out->data[out->len - 1] == '/');
+    int pathSlash = (path[0] == '/');
+
+    if (baseSlash && pathSlash)
+    {
+        return llmBufAppend(out, path + 1);
+    }
+
+    if (!baseSlash && !pathSlash)
+    {
+        if (llmBufAppend(out, "/") != 0)
+        {
+            return -1;
+        }
+    }
+
+    return llmBufAppend(out, path);
+}
+
 // Fill urlBuf, authBuf and the NULL-terminated header array.  `headers`
 // must have room for at least 4 entries.  Returns 0 on success, -1 on
 // failure (with a message appended to ctx->errbuf).
@@ -761,15 +851,10 @@ static int llmapiBuildRequest(LlmmapiCtx* ctx,
         return -1;
     }
 
-    llmBufAppend(urlBuf, baseUrl);
-    size_t baseLen = urlBuf->len;
-    if (baseLen > 0 && urlBuf->data[baseLen - 1] != '/')
+    if (llmapiJoinUrl(urlBuf, baseUrl, "chat/completions") != 0)
     {
-        llmBufAppend(urlBuf, "/chat/completions");
-    }
-    else
-    {
-        llmBufAppend(urlBuf, "chat/completions");
+        llmBufAppend(&ctx->errbuf, "Failed to build request URL");
+        return -1;
     }
 
     llmBufAppend(authBuf, "Authorization: Bearer ");
@@ -854,6 +939,152 @@ char* llmapiChatComplete(LlmmapiCtx* ctx,
 
     llmBufFree(&bodyBuf);
     llmBufFree(&urlBuf);
+    llmBufSecureFree(&authBuf);
+
+    if (rc != 0 || (result.error != NULL && result.error[0] != '\0'))
+    {
+        llmBufAppend(&ctx->errbuf,
+                     (result.error != NULL) ? result.error
+                                            : "transport error");
+        llmBufFree(&respBuf);
+        return NULL;
+    }
+
+    if (result.status < 200 || result.status >= 300)
+    {
+        llmBufAppendFmt(&ctx->errbuf,
+                        "HTTP %ld: %s",
+                        result.status,
+                        respBuf.data ? respBuf.data : "");
+        llmBufFree(&respBuf);
+        return NULL;
+    }
+
+    return llmBufDetach(&respBuf);
+}
+
+// ==================== Raw Request ====================
+
+char* llmapiRequest(LlmmapiCtx* ctx,
+                    const char* baseUrl,
+                    const char* apiKey,
+                    const char* method,
+                    const char* path,
+                    const char* contentType,
+                    const void* body,
+                    size_t bodyLen)
+{
+    if (ctx == NULL || baseUrl == NULL || method == NULL || path == NULL)
+    {
+        return NULL;
+    }
+
+    llmBufFree(&ctx->errbuf);
+    llmBufInit(&ctx->errbuf);
+
+    if (!ctx->hasTransport)
+    {
+        llmBufAppend(&ctx->errbuf,
+                     "no transport set (call llmapiSetTransport)");
+        return NULL;
+    }
+
+    if (method[0] == '\0' || llmapiHasCrlf(method))
+    {
+        llmBufAppend(&ctx->errbuf, "invalid method");
+        return NULL;
+    }
+
+    if (llmapiHasCrlf(baseUrl) || llmapiHasCrlf(path))
+    {
+        llmBufAppend(&ctx->errbuf, "baseUrl/path contains invalid characters");
+        return NULL;
+    }
+
+    if (llmapiHasCrlf(apiKey))
+    {
+        llmBufAppend(&ctx->errbuf, "apiKey contains invalid characters");
+        return NULL;
+    }
+
+    if (llmapiHasCrlf(contentType))
+    {
+        llmBufAppend(&ctx->errbuf, "contentType contains invalid characters");
+        return NULL;
+    }
+
+    if (body == NULL && bodyLen != 0)
+    {
+        llmBufAppend(&ctx->errbuf, "body is NULL but bodyLen is non-zero");
+        return NULL;
+    }
+
+    LlmBuf urlBuf;
+    LlmBuf authBuf;
+    LlmBuf ctBuf;
+    llmBufInit(&urlBuf);
+    llmBufInit(&authBuf);
+    llmBufInit(&ctBuf);
+
+    if (llmapiJoinUrl(&urlBuf, baseUrl, path) != 0)
+    {
+        llmBufAppend(&ctx->errbuf, "Failed to build request URL");
+        llmBufFree(&urlBuf);
+        return NULL;
+    }
+
+    const char* headers[3];
+    size_t nh = 0;
+
+    if (contentType != NULL)
+    {
+        if (llmBufAppend(&ctBuf, "Content-Type: ") != 0 ||
+            llmBufAppend(&ctBuf, contentType) != 0)
+        {
+            llmBufAppend(&ctx->errbuf, "Out of memory");
+            llmBufFree(&urlBuf);
+            llmBufFree(&ctBuf);
+            return NULL;
+        }
+        headers[nh++] = ctBuf.data;
+    }
+
+    if (apiKey != NULL)
+    {
+        if (llmBufAppend(&authBuf, "Authorization: Bearer ") != 0 ||
+            llmBufAppend(&authBuf, apiKey) != 0)
+        {
+            llmBufAppend(&ctx->errbuf, "Out of memory");
+            llmBufFree(&urlBuf);
+            llmBufFree(&ctBuf);
+            llmBufFree(&authBuf);
+            return NULL;
+        }
+        headers[nh++] = authBuf.data;
+    }
+
+    headers[nh] = NULL;
+
+    LlmmapiHttpRequest httpReq;
+    httpReq.method    = method;
+    httpReq.url       = urlBuf.data;
+    httpReq.headers   = headers;
+    httpReq.body      = body;
+    httpReq.bodyLen   = bodyLen;
+    httpReq.timeoutMs = 120000L;
+
+    LlmBuf respBuf;
+    llmBufInit(&respBuf);
+
+    LlmmapiHttpResult result;
+    result.status = 0;
+    result.error  = NULL;
+
+    int rc = ctx->transport.perform(ctx->transport.userdata, &httpReq,
+                                    llmCollectChunk, &respBuf, &result);
+
+    llmBufFree(&urlBuf);
+    llmBufFree(&ctBuf);
     llmBufSecureFree(&authBuf);
 
     if (rc != 0 || (result.error != NULL && result.error[0] != '\0'))

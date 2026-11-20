@@ -154,6 +154,42 @@ llmapiReqSet(req, "stop",             "[\"END\"]");
 llmapiReqSet(req, "seed",             "42");
 ```
 
+### Multimodal Input (raw content parts)
+
+`llmapiReqAddMsgJson` accepts the `content` field as raw JSON. The library does
+**not** read files or base64-encode anything — you build the array yourself
+(e.g. with a base64 encoder in your app):
+
+```c
+// caller-provided data: URL (base64 produced outside the library)
+const char* parts =
+    "[{\"type\":\"text\",\"text\":\"What is in this image?\"},"
+    " {\"type\":\"image_url\","
+    "  \"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KG...\"}}]";
+
+llmapiReqAddMsgJson(req, LLMAPI_ROLE_USER, parts);
+char* resp = llmapiChatComplete(ctx, url, key, req);
+```
+
+Text files need no special handling — read them into a string and pass to
+`llmapiReqAddMsg` (multi-line content is supported).
+
+### Raw Request
+
+`llmapiRequest` sends arbitrary bytes through the injected transport. It sets
+only `Content-Type` (when given) and `Authorization: Bearer <apiKey>` (when
+`apiKey` is non-NULL):
+
+```c
+// e.g. a caller-built multipart upload to the Files API
+char* resp = llmapiRequest(ctx, "https://api.openai.com/v1", "sk-...",
+                           "POST", "/files",
+                           "multipart/form-data; boundary=----xyz",
+                           multipartBody, multipartLen);
+```
+
+> This buffers the whole response. For chat, prefer the higher-level helpers.
+
 ## API
 
 ### Lifecycle / Error
@@ -178,6 +214,7 @@ llmapiReqSet(req, "seed",             "42");
 |----------|-------------|
 | `llmapiReqNew(model)` / `llmapiReqFree(req)` | Request lifecycle |
 | `llmapiReqAddMsg(req, role, content)` | Add a message (role: system/user/assistant/tool); `content` may be multi-line |
+| `llmapiReqAddMsgJson(req, role, json)` | Add a message with raw JSON `content` parts (no encoding done) |
 | `llmapiReqAddAssistantToolCalls(req, json)` | Add assistant message with tool_calls |
 | `llmapiReqAddToolResult(req, id, name, content)` | Add tool result message |
 | `llmapiReqSetMaxTokens(req, n)` | Set max_tokens |
@@ -191,6 +228,12 @@ llmapiReqSet(req, "seed",             "42");
 | `llmapiChatComplete(ctx, url, key, req)` | Sync (returns JSON string) |
 | `llmapiChatCompleteStream(ctx, url, key, req, cb, ud)` | Streaming with type-aware callback |
 | `llmapiStreamGetUsage(ctx, &total, &prompt, &comp)` | Token usage from last streaming call |
+
+### Raw Request
+
+| Function | Description |
+|----------|-------------|
+| `llmapiRequest(ctx, url, key, method, path, contentType, body, len)` | Send raw bytes via the transport; returns the buffered response body |
 
 ### Response Helpers
 

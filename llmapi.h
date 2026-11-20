@@ -131,6 +131,14 @@ void        llmapiReqFree(LlmmapiReq* req);
 // The role and content strings are copied internally.
 void llmapiReqAddMsg(LlmmapiReq* req, const char* role, const char* content);
 
+// Add a message whose `content` is raw JSON (content parts) instead of a plain
+// string.  contentJson must be a valid JSON array, e.g.:
+//   [{"type":"text","text":"describe this"},
+//    {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]
+// The library does not read files or perform base64 encoding; build the array
+// yourself.  Invalid JSON makes the chat call fail.
+void llmapiReqAddMsgJson(LlmmapiReq* req, const char* role, const char* contentJson);
+
 // Add an assistant message with tool_calls (content is null).
 // toolCallsJson must be a valid JSON array of tool call objects.
 void llmapiReqAddAssistantToolCalls(LlmmapiReq* req, const char* toolCallsJson);
@@ -156,6 +164,31 @@ char* llmapiChatComplete(LlmmapiCtx* ctx,
                           const char* baseUrl,
                           const char* apiKey,
                           const LlmmapiReq* req);
+
+// ==================== Raw Request ====================
+
+// Perform an arbitrary HTTP request through the injected transport and return
+// the raw response body (malloc'd; caller frees) on HTTP 2xx, or NULL.
+//
+// - method:       "GET", "POST", "PUT", "DELETE", ...
+// - path:         appended to baseUrl, e.g. "files" or "/files"
+// - contentType:  value for Content-Type, or NULL to omit it
+//                 e.g. "application/json"
+//                      "multipart/form-data; boundary=----xyz"
+// - apiKey:       if non-NULL, adds "Authorization: Bearer <apiKey>"
+// - body/bodyLen: raw request bytes (NULL/0 for GET)
+//
+// Only Content-Type and Authorization are set.  The whole response body is
+// buffered, so this is not suitable for streaming.  Use llmapiStrError() for
+// the reason on failure.
+char* llmapiRequest(LlmmapiCtx* ctx,
+                    const char* baseUrl,
+                    const char* apiKey,
+                    const char* method,
+                    const char* path,
+                    const char* contentType,
+                    const void* body,
+                    size_t bodyLen);
 
 // ==================== Streaming ====================
 
