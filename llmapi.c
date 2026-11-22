@@ -1,8 +1,7 @@
 // llmapi.c -- Implementation of libllmapi
 //
-// A C99 library for calling LLM APIs (OpenAI-compatible).
-//
-// The HTTP(S) transport is injected by the caller (see llmapiSetTransport).
+// Neutral message model + pluggable wire providers (OpenAI / Anthropic).
+// HTTP(S) transport is injected by the caller.
 //
 // Copyright (c) 2025, libllmapi contributors
 // All rights reserved.
@@ -40,10 +39,10 @@
 
 // ==================== Internal Constants ====================
 
-#define LLMAPI_BUF_MAX   (100 * 1024 * 1024)  // 100 MB max per buffer
-#define LLMAPI_LINE_MAX  (64 * 1024)          // 64 KB max per SSE line
-
-// ==================== Internal Static State ====================
+#define LLMAPI_BUF_MAX            (100 * 1024 * 1024)
+#define LLMAPI_LINE_MAX           (64 * 1024)
+#define LLMAPI_DEFAULT_MAX_TOKENS 4096
+#define LLMAPI_ANTHROPIC_VERSION  "2023-06-01"
 
 // ==================== Internal Dynamic Buffer ====================
 
@@ -179,48 +178,98 @@ static void llmBufSecureFree(LlmBuf* buf)
 
 typedef struct
 {
-    char* role;
-    char* content;
-    int   contentIsJson;  // 1 = content is a raw JSON value (content parts)
-    char* toolCallsJson;  // JSON array string for assistant tool_calls
-    char* toolCallId;      // for tool role messages
-    char* toolCallName;    // tool function name (for display)
-} LlmMsg;
+    char* name;
+    char* description;
+    char* parametersJson;
+} LlmTool;
 
 struct LlmmapiReq
 {
     char* model;
 
-    int     hasMaxTokens;
-    size_t  maxTokens;
-    int     hasTemperature;
-    double  temperature;
+    LlmmapiMessage** messages;
+    size_t           messageCount;
+    size_t           messageCap;
 
-    LlmMsg* msgs;
-    size_t  msgCount;
-    size_t  msgCap;
+    LlmTool* tools;
+    size_t   toolCount;
+    size_t   toolCap;
 
-    char**  extraKeys;
-    char**  extraValues;
-    size_t  extraCount;
-    size_t  extraCap;
+    int    hasMaxTokens;
+    size_t maxTokens;
+
+    int    hasTemperature;
+    double temperature;
+
+    int    hasTopP;
+    double topP;
+
+    char* stopJson;
+
+    char** extraKeys;
+    char** extraValues;
+    size_t extraCount;
+    size_t extraCap;
 };
 
 struct LlmmapiCtx
 {
     LlmBuf errbuf;
 
-    int               hasTransport;
-    LlmmapiTransport  transport;
+    int              hasTransport;
+    LlmmapiTransport transport;
 
-    int lastTotalTokens;
-    int lastPromptTokens;
-    int lastCompletionTokens;
+    LlmmapiApi api;
+
+    long lastTotalTokens;
+    long lastPromptTokens;
+    long lastCompletionTokens;
 };
 
-// ==================== Internal: Validation ====================
+struct LlmmapiResp
+{
+    LlmmapiMessage message;
+    char*          finishReason;
+    long           inputTokens;
+    long           outputTokens;
+    long           totalTokens;
+    char*          rawJson;
+};
 
-static int llmapiHasCrlf(const char* s)
+// ==================== Internal: String helpers ====================
+
+static char* llmStrDup(const char* s)
+{
+    if (s == NULL)
+    {
+        return NULL;
+    }
+
+    size_t n = strlen(s) + 1;
+    char* p = (char*)malloc(n);
+    if (p != NULL)
+    {
+        memcpy(p, s, n);
+    }
+
+    return p;
+}
+
+static char* llmStrNDup(const char* s, size_t n)
+{
+    char* p = (char*)malloc(n + 1);
+    if (p == NULL)
+    {
+        return NULL;
+    }
+
+    memcpy(p, s, n);
+    p[n] = '\0';
+
+    return p;
+}
+
+static int llmHasCrlf(const char* s)
 {
     if (s == NULL)
     {
@@ -239,35 +288,34 @@ static int llmapiHasCrlf(const char* s)
     return 0;
 }
 
-// ==================== Internal: Message Helpers ====================
+// ==================== Internal: Part / message helpers ====================
 
-static LlmMsg llmMsgMake(const char* role, const char* content)
+static void llmPartFree(LlmmapiPart* p)
 {
-    LlmMsg msg;
-    msg.role         = (char*)malloc(strlen(role) + 1);
-    msg.content      = (char*)malloc(strlen(content) + 1);
-    msg.contentIsJson = 0;
-    msg.toolCallsJson = NULL;
-    msg.toolCallId   = NULL;
-    msg.toolCallName = NULL;
-
-    if (msg.role && msg.content)
+    if (p == NULL)
     {
-        strcpy(msg.role,    role);
-        strcpy(msg.content, content);
-    }
-    else
-    {
-        free(msg.role);
-        free(msg.content);
-        msg.role    = NULL;
-        msg.content = NULL;
+        return;
     }
 
-    return msg;
+    free(p->text);
+    free(p->url);
+    free(p->mimeType);
+    free(p->filename);
+    free(p->fileId);
+    free(p->toolCallId);
+    free(p->toolName);
+
+    memset(p, 0, sizeof(*p));
 }
 
-static void llmMsgFree(LlmMsg* msg)
+static void llmMessageInit(LlmmapiMessage* msg)
+{
+    msg->role      = NULL;
+    msg->parts     = NULL;
+    msg->partCount = 0;
+}
+
+static void llmMessageFree(LlmmapiMessage* msg)
 {
     if (msg == NULL)
     {
@@ -275,10 +323,116 @@ static void llmMsgFree(LlmMsg* msg)
     }
 
     free(msg->role);
-    free(msg->content);
-    free(msg->toolCallsJson);
-    free(msg->toolCallId);
-    free(msg->toolCallName);
+
+    for (size_t i = 0; i < msg->partCount; i++)
+    {
+        llmPartFree(&msg->parts[i]);
+    }
+    free(msg->parts);
+
+    llmMessageInit(msg);
+}
+
+static int llmMessageAddPart(LlmmapiMessage* msg, const LlmmapiPart* part)
+{
+    LlmmapiPart* p = (LlmmapiPart*)realloc(msg->parts,
+                                           (msg->partCount + 1) * sizeof(LlmmapiPart));
+    if (p == NULL)
+    {
+        return -1;
+    }
+
+    msg->parts = p;
+    msg->parts[msg->partCount++] = *part;
+
+    return 0;
+}
+
+// Allocate a zeroed part at the end of the message; returns NULL on OOM.
+static LlmmapiPart* llmMessageNewPart(LlmmapiMessage* msg)
+{
+    LlmmapiPart* p = (LlmmapiPart*)realloc(msg->parts,
+                                           (msg->partCount + 1) * sizeof(LlmmapiPart));
+    if (p == NULL)
+    {
+        return NULL;
+    }
+
+    msg->parts = p;
+    LlmmapiPart* part = &msg->parts[msg->partCount++];
+    memset(part, 0, sizeof(*part));
+
+    return part;
+}
+
+static void llmAddTextPart(LlmmapiMessage* msg, LlmmapiPartType type,
+                           const char* text)
+{
+    if (text == NULL)
+    {
+        return;
+    }
+
+    LlmmapiPart* p = llmMessageNewPart(msg);
+    if (p == NULL)
+    {
+        return;
+    }
+
+    p->type = type;
+    p->text = llmStrDup(text);
+}
+
+static int llmMessageHasPart(const LlmmapiMessage* msg, LlmmapiPartType type)
+{
+    for (size_t i = 0; i < msg->partCount; i++)
+    {
+        if (msg->parts[i].type == type)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static char* llmConcatParts(const LlmmapiMessage* msg, LlmmapiPartType type)
+{
+    LlmBuf buf;
+    llmBufInit(&buf);
+
+    for (size_t i = 0; i < msg->partCount; i++)
+    {
+        if (msg->parts[i].type == type && msg->parts[i].text != NULL)
+        {
+            llmBufAppend(&buf, msg->parts[i].text);
+        }
+    }
+
+    if (buf.len == 0)
+    {
+        llmBufFree(&buf);
+        return NULL;
+    }
+
+    return llmBufDetach(&buf);
+}
+
+// ==================== Public: Message accessors ====================
+
+size_t llmapiMessageGetPartCount(const LlmmapiMessage* msg)
+{
+    return msg ? msg->partCount : 0;
+}
+
+const LlmmapiPart* llmapiMessageGetPart(const LlmmapiMessage* msg, size_t idx)
+{
+    if (msg == NULL || idx >= msg->partCount)
+    {
+        return NULL;
+    }
+
+    return &msg->parts[idx];
 }
 
 // ==================== Lifecycle ====================
@@ -295,6 +449,7 @@ LlmmapiCtx* llmapiInit(void)
 
     ctx->hasTransport = 0;
     memset(&ctx->transport, 0, sizeof(ctx->transport));
+    ctx->api = LLMMAPI_API_OPENAI;
 
     ctx->lastTotalTokens      = 0;
     ctx->lastPromptTokens     = 0;
@@ -331,7 +486,7 @@ const char* llmapiStrError(LlmmapiCtx* ctx)
     return ctx->errbuf.data ? ctx->errbuf.data : "";
 }
 
-// ==================== Transport ====================
+// ==================== Transport / provider ====================
 
 void llmapiSetTransport(LlmmapiCtx* ctx, const LlmmapiTransport* transport)
 {
@@ -351,6 +506,20 @@ void llmapiSetTransport(LlmmapiCtx* ctx, const LlmmapiTransport* transport)
     ctx->hasTransport = 1;
 }
 
+void llmapiSetApi(LlmmapiCtx* ctx, LlmmapiApi api)
+{
+    if (ctx == NULL)
+    {
+        return;
+    }
+
+    if (api == LLMMAPI_API_OPENAI || api == LLMMAPI_API_ANTHROPIC ||
+        api == LLMMAPI_API_OPENAI_RESPONSES)
+    {
+        ctx->api = api;
+    }
+}
+
 // ==================== Request ====================
 
 LlmmapiReq* llmapiReqNew(const char* model)
@@ -360,34 +529,18 @@ LlmmapiReq* llmapiReqNew(const char* model)
         return NULL;
     }
 
-    LlmmapiReq* req = (LlmmapiReq*)malloc(sizeof(LlmmapiReq));
+    LlmmapiReq* req = (LlmmapiReq*)calloc(1, sizeof(LlmmapiReq));
     if (req == NULL)
     {
         return NULL;
     }
 
-    req->model = (char*)malloc(strlen(model) + 1);
+    req->model = llmStrDup(model);
     if (req->model == NULL)
     {
         free(req);
         return NULL;
     }
-
-    strcpy(req->model, model);
-
-    req->hasMaxTokens   = 0;
-    req->maxTokens      = 0;
-    req->hasTemperature = 0;
-    req->temperature    = 0.0;
-
-    req->msgs     = NULL;
-    req->msgCount = 0;
-    req->msgCap   = 0;
-
-    req->extraKeys   = NULL;
-    req->extraValues = NULL;
-    req->extraCount  = 0;
-    req->extraCap    = 0;
 
     return req;
 }
@@ -401,11 +554,22 @@ void llmapiReqFree(LlmmapiReq* req)
 
     free(req->model);
 
-    for (size_t i = 0; i < req->msgCount; i++)
+    for (size_t i = 0; i < req->messageCount; i++)
     {
-        llmMsgFree(&req->msgs[i]);
+        llmMessageFree(req->messages[i]);
+        free(req->messages[i]);
     }
-    free(req->msgs);
+    free(req->messages);
+
+    for (size_t i = 0; i < req->toolCount; i++)
+    {
+        free(req->tools[i].name);
+        free(req->tools[i].description);
+        free(req->tools[i].parametersJson);
+    }
+    free(req->tools);
+
+    free(req->stopJson);
 
     for (size_t i = 0; i < req->extraCount; i++)
     {
@@ -418,165 +582,194 @@ void llmapiReqFree(LlmmapiReq* req)
     free(req);
 }
 
-void llmapiReqAddMsg(LlmmapiReq* req, const char* role, const char* content)
+LlmmapiMessage* llmapiReqAddMessage(LlmmapiReq* req, const char* role)
 {
-    if (req == NULL || role == NULL || content == NULL)
+    if (req == NULL || role == NULL || llmHasCrlf(role))
     {
-        return;
+        return NULL;
     }
 
-    if (llmapiHasCrlf(role))
+    if (req->messageCount >= req->messageCap)
     {
-        return;
-    }
-
-    if (req->msgCount >= req->msgCap)
-    {
-        size_t newCap = req->msgCap == 0 ? 4 : req->msgCap * 2;
-        LlmMsg* p = (LlmMsg*)realloc(req->msgs,
-                                     newCap * sizeof(LlmMsg));
+        size_t newCap = req->messageCap == 0 ? 4 : req->messageCap * 2;
+        LlmmapiMessage** p = (LlmmapiMessage**)realloc(
+            req->messages, newCap * sizeof(LlmmapiMessage*));
         if (p == NULL)
         {
-            return;
+            return NULL;
         }
 
-        req->msgs   = p;
-        req->msgCap = newCap;
+        req->messages   = p;
+        req->messageCap = newCap;
     }
 
-    LlmMsg msg = llmMsgMake(role, content);
-    if (msg.role == NULL || msg.content == NULL)
+    LlmmapiMessage* msg = (LlmmapiMessage*)calloc(1, sizeof(LlmmapiMessage));
+    if (msg == NULL)
     {
-        llmMsgFree(&msg);
-        return;
+        return NULL;
     }
 
-    req->msgs[req->msgCount++] = msg;
+    msg->role = llmStrDup(role);
+    if (msg->role == NULL)
+    {
+        free(msg);
+        return NULL;
+    }
+
+    req->messages[req->messageCount++] = msg;
+
+    return msg;
 }
 
-void llmapiReqAddMsgJson(LlmmapiReq* req, const char* role, const char* contentJson)
+void llmapiReqAddMsg(LlmmapiReq* req, const char* role, const char* text)
 {
-    if (req == NULL || role == NULL || contentJson == NULL)
+    LlmmapiMessage* msg = llmapiReqAddMessage(req, role);
+    if (msg != NULL)
     {
-        return;
+        llmapiMsgAddText(msg, text);
     }
-
-    if (llmapiHasCrlf(role))
-    {
-        return;
-    }
-
-    if (req->msgCount >= req->msgCap)
-    {
-        size_t newCap = req->msgCap == 0 ? 4 : req->msgCap * 2;
-        LlmMsg* p = (LlmMsg*)realloc(req->msgs,
-                                     newCap * sizeof(LlmMsg));
-        if (p == NULL)
-        {
-            return;
-        }
-
-        req->msgs   = p;
-        req->msgCap = newCap;
-    }
-
-    LlmMsg msg = llmMsgMake(role, contentJson);
-    if (msg.role == NULL || msg.content == NULL)
-    {
-        llmMsgFree(&msg);
-        return;
-    }
-
-    msg.contentIsJson = 1;
-    req->msgs[req->msgCount++] = msg;
 }
 
-void llmapiReqAddAssistantToolCalls(LlmmapiReq* req, const char* toolCallsJson)
+void llmapiMsgAddText(LlmmapiMessage* msg, const char* text)
 {
-    if (req == NULL || toolCallsJson == NULL)
+    if (msg == NULL || text == NULL)
     {
         return;
     }
 
-    if (req->msgCount >= req->msgCap)
+    LlmmapiPart p;
+    memset(&p, 0, sizeof(p));
+    p.type = LLMMAPI_PART_TEXT;
+    p.text = llmStrDup(text);
+
+    if (p.text == NULL || llmMessageAddPart(msg, &p) != 0)
     {
-        size_t newCap = req->msgCap == 0 ? 4 : req->msgCap * 2;
-        LlmMsg* p = (LlmMsg*)realloc(req->msgs, newCap * sizeof(LlmMsg));
-        if (p == NULL)
-        {
-            return;
-        }
-        req->msgs   = p;
-        req->msgCap = newCap;
+        llmPartFree(&p);
+    }
+}
+
+void llmapiMsgAddImage(LlmmapiMessage* msg, const char* url)
+{
+    if (msg == NULL || url == NULL)
+    {
+        return;
     }
 
-    LlmMsg msg;
-    msg.role         = (char*)malloc(strlen("assistant") + 1);
-    msg.content      = (char*)malloc(1);
-    msg.contentIsJson = 0;
-    msg.toolCallsJson = (char*)malloc(strlen(toolCallsJson) + 1);
-    msg.toolCallId   = NULL;
-    msg.toolCallName = NULL;
+    LlmmapiPart p;
+    memset(&p, 0, sizeof(p));
+    p.type = LLMMAPI_PART_IMAGE;
+    p.url  = llmStrDup(url);
 
-    if (msg.role && msg.content && msg.toolCallsJson)
+    if (p.url == NULL || llmMessageAddPart(msg, &p) != 0)
     {
-        strcpy(msg.role, "assistant");
-        msg.content[0] = '\0';
-        strcpy(msg.toolCallsJson, toolCallsJson);
+        llmPartFree(&p);
+    }
+}
+
+void llmapiMsgAddFile(LlmmapiMessage* msg, const char* filename,
+                      const char* mimeType, const char* dataUrlOrFileId)
+{
+    if (msg == NULL || dataUrlOrFileId == NULL)
+    {
+        return;
+    }
+
+    LlmmapiPart p;
+    memset(&p, 0, sizeof(p));
+    p.type     = LLMMAPI_PART_FILE;
+    p.filename = llmStrDup(filename);
+    p.mimeType = llmStrDup(mimeType);
+
+    if (strncmp(dataUrlOrFileId, "data:", 5) == 0)
+    {
+        p.url = llmStrDup(dataUrlOrFileId);
     }
     else
     {
-        llmMsgFree(&msg);
-        return;
+        p.fileId = llmStrDup(dataUrlOrFileId);
     }
 
-    req->msgs[req->msgCount++] = msg;
+    if (llmMessageAddPart(msg, &p) != 0)
+    {
+        llmPartFree(&p);
+    }
 }
 
-void llmapiReqAddToolResult(LlmmapiReq* req, const char* toolCallId, const char* name, const char* content)
+void llmapiMsgAddToolCall(LlmmapiMessage* msg, const char* toolCallId,
+                          const char* toolName, const char* argsJson)
 {
-    if (req == NULL || toolCallId == NULL || content == NULL)
+    if (msg == NULL || toolName == NULL)
     {
         return;
     }
 
-    if (req->msgCount >= req->msgCap)
+    LlmmapiPart p;
+    memset(&p, 0, sizeof(p));
+    p.type       = LLMMAPI_PART_TOOL_CALL;
+    p.toolCallId = llmStrDup(toolCallId);
+    p.toolName   = llmStrDup(toolName);
+    p.text       = llmStrDup(argsJson ? argsJson : "{}");
+
+    if (llmMessageAddPart(msg, &p) != 0)
     {
-        size_t newCap = req->msgCap == 0 ? 4 : req->msgCap * 2;
-        LlmMsg* p = (LlmMsg*)realloc(req->msgs, newCap * sizeof(LlmMsg));
+        llmPartFree(&p);
+    }
+}
+
+void llmapiMsgAddToolResult(LlmmapiMessage* msg, const char* toolCallId,
+                            const char* content)
+{
+    if (msg == NULL || toolCallId == NULL)
+    {
+        return;
+    }
+
+    LlmmapiPart p;
+    memset(&p, 0, sizeof(p));
+    p.type       = LLMMAPI_PART_TOOL_RESULT;
+    p.toolCallId = llmStrDup(toolCallId);
+    p.text       = llmStrDup(content ? content : "");
+
+    if (llmMessageAddPart(msg, &p) != 0)
+    {
+        llmPartFree(&p);
+    }
+}
+
+void llmapiReqAddTool(LlmmapiReq* req, const char* name,
+                      const char* description, const char* parametersJson)
+{
+    if (req == NULL || name == NULL)
+    {
+        return;
+    }
+
+    if (req->toolCount >= req->toolCap)
+    {
+        size_t newCap = req->toolCap == 0 ? 4 : req->toolCap * 2;
+        LlmTool* p = (LlmTool*)realloc(req->tools, newCap * sizeof(LlmTool));
         if (p == NULL)
         {
             return;
         }
-        req->msgs   = p;
-        req->msgCap = newCap;
+
+        req->tools   = p;
+        req->toolCap = newCap;
     }
 
-    LlmMsg msg;
-    msg.role         = (char*)malloc(strlen("tool") + 1);
-    msg.content      = (char*)malloc(strlen(content) + 1);
-    msg.contentIsJson = 0;
-    msg.toolCallId   = (char*)malloc(strlen(toolCallId) + 1);
-    msg.toolCallsJson = NULL;
-    msg.toolCallName = name ? (char*)malloc(strlen(name) + 1) : NULL;
+    LlmTool tool;
+    tool.name           = llmStrDup(name);
+    tool.description    = llmStrDup(description);
+    tool.parametersJson = llmStrDup(parametersJson);
 
-    if (msg.role && msg.content && msg.toolCallId)
+    if (tool.name == NULL)
     {
-        strcpy(msg.role, "tool");
-        strcpy(msg.content, content);
-        strcpy(msg.toolCallId, toolCallId);
-        if (msg.toolCallName)
-        {
-            strcpy(msg.toolCallName, name);
-        }
-    }
-    else
-    {
-        llmMsgFree(&msg);
+        free(tool.description);
+        free(tool.parametersJson);
         return;
     }
 
-    req->msgs[req->msgCount++] = msg;
+    req->tools[req->toolCount++] = tool;
 }
 
 void llmapiReqSetMaxTokens(LlmmapiReq* req, size_t maxTokens)
@@ -601,7 +794,29 @@ void llmapiReqSetTemperature(LlmmapiReq* req, double temp)
     req->temperature    = temp;
 }
 
-void llmapiReqSet(LlmmapiReq* req, const char* key, const char* jsonValue)
+void llmapiReqSetTopP(LlmmapiReq* req, double topP)
+{
+    if (req == NULL)
+    {
+        return;
+    }
+
+    req->hasTopP = 1;
+    req->topP    = topP;
+}
+
+void llmapiReqSetStop(LlmmapiReq* req, const char* jsonArray)
+{
+    if (req == NULL)
+    {
+        return;
+    }
+
+    free(req->stopJson);
+    req->stopJson = llmStrDup(jsonArray);
+}
+
+void llmapiReqSetExtra(LlmmapiReq* req, const char* key, const char* jsonValue)
 {
     if (req == NULL || key == NULL || jsonValue == NULL)
     {
@@ -638,8 +853,8 @@ void llmapiReqSet(LlmmapiReq* req, const char* key, const char* jsonValue)
         req->extraCap    = newCap;
     }
 
-    req->extraKeys[req->extraCount]   = (char*)malloc(strlen(key) + 1);
-    req->extraValues[req->extraCount] = (char*)malloc(strlen(jsonValue) + 1);
+    req->extraKeys[req->extraCount]   = llmStrDup(key);
+    req->extraValues[req->extraCount] = llmStrDup(jsonValue);
 
     if (req->extraKeys[req->extraCount] == NULL ||
         req->extraValues[req->extraCount] == NULL)
@@ -649,15 +864,366 @@ void llmapiReqSet(LlmmapiReq* req, const char* key, const char* jsonValue)
         return;
     }
 
-    strcpy(req->extraKeys[req->extraCount],   key);
-    strcpy(req->extraValues[req->extraCount], jsonValue);
     req->extraCount++;
 }
 
-// ==================== Internal: JSON Builder ====================
+// ==================== Internal: JSON helpers ====================
 
-static int llmapiBuildRequestBody(const LlmmapiReq* req, int stream, LlmBuf* out)
+static const char* llmJsonStr(const cJSON* obj, const char* key)
 {
+    cJSON* item = cJSON_GetObjectItem(obj, key);
+    if (item != NULL && cJSON_IsString(item))
+    {
+        return item->valuestring;
+    }
+
+    return NULL;
+}
+
+static int llmJsonLong(const cJSON* obj, const char* key, long* out)
+{
+    cJSON* item = cJSON_GetObjectItem(obj, key);
+    if (item != NULL && cJSON_IsNumber(item))
+    {
+        *out = (long)item->valuedouble;
+        return 1;
+    }
+
+    return 0;
+}
+
+// Parse "data:<mime>;base64,<payload>".  On success, *mimeOut is malloc'd and
+// *dataOut points into `url` (not allocated).
+static int llmParseDataUrl(const char* url, char** mimeOut, const char** dataOut)
+{
+    if (url == NULL || strncmp(url, "data:", 5) != 0)
+    {
+        return 0;
+    }
+
+    const char* p    = url + 5;
+    const char* semi = strchr(p, ';');
+    if (semi == NULL || strncmp(semi, ";base64,", 8) != 0)
+    {
+        return 0;
+    }
+
+    char* mime = llmStrNDup(p, (size_t)(semi - p));
+    if (mime == NULL)
+    {
+        return 0;
+    }
+
+    *mimeOut = mime;
+    *dataOut = semi + 8;
+
+    return 1;
+}
+
+// Append a parsed JSON value, falling back to a string when parsing fails.
+static void llmAddJsonValue(cJSON* root, const char* key, const char* value)
+{
+    cJSON* parsed = cJSON_Parse(value);
+    if (parsed == NULL)
+    {
+        parsed = cJSON_CreateString(value);
+    }
+
+    if (parsed != NULL)
+    {
+        cJSON_AddItemToObject(root, key, parsed);
+    }
+}
+
+// ==================== Internal: Provider interface ====================
+
+typedef struct
+{
+    LlmmapiStreamCb cb;
+    void*           userdata;
+    int             done;
+    long            inputTokens;
+    long            outputTokens;
+} LlmStreamSink;
+
+static void llmEmit(LlmStreamSink* sink, LlmmapiStreamType type,
+                    const char* text, const char* toolCallId,
+                    const char* toolName, size_t toolIndex)
+{
+    LlmmapiStreamEvent ev;
+    ev.type       = type;
+    ev.text       = text;
+    ev.toolCallId = toolCallId;
+    ev.toolName   = toolName;
+    ev.toolIndex  = toolIndex;
+
+    sink->cb(&ev, sink->userdata);
+}
+
+typedef struct
+{
+    const char*        path;
+    const char*        authHeader;
+    const char*        authPrefix;
+    const char* const* staticHeaders;
+
+    int  (*encode)(LlmmapiCtx* ctx, const LlmmapiReq* req, int stream,
+                   LlmBuf* body);
+    int  (*decode)(LlmmapiCtx* ctx, const char* rawJson, LlmmapiResp* out);
+    void (*streamDecode)(const char* payload, LlmStreamSink* sink);
+} LlmProvider;
+
+// ==================== Provider: OpenAI ====================
+
+static void openaiAddContentPart(cJSON* content, const LlmmapiPart* part)
+{
+    if (part->type == LLMMAPI_PART_TEXT)
+    {
+        cJSON* b = cJSON_CreateObject();
+        if (b == NULL) return;
+        cJSON_AddStringToObject(b, "type", "text");
+        cJSON_AddStringToObject(b, "text", part->text ? part->text : "");
+        cJSON_AddItemToArray(content, b);
+    }
+    else if (part->type == LLMMAPI_PART_IMAGE)
+    {
+        cJSON* b = cJSON_CreateObject();
+        if (b == NULL) return;
+        cJSON_AddStringToObject(b, "type", "image_url");
+        cJSON* iu = cJSON_AddObjectToObject(b, "image_url");
+        if (iu != NULL)
+        {
+            cJSON_AddStringToObject(iu, "url", part->url ? part->url : "");
+        }
+        cJSON_AddItemToArray(content, b);
+    }
+    else if (part->type == LLMMAPI_PART_FILE)
+    {
+        cJSON* b = cJSON_CreateObject();
+        if (b == NULL) return;
+        cJSON_AddStringToObject(b, "type", "file");
+        cJSON* f = cJSON_AddObjectToObject(b, "file");
+        if (f != NULL)
+        {
+            if (part->fileId != NULL)
+            {
+                cJSON_AddStringToObject(f, "file_id", part->fileId);
+            }
+            else
+            {
+                if (part->filename != NULL)
+                {
+                    cJSON_AddStringToObject(f, "filename", part->filename);
+                }
+                if (part->url != NULL)
+                {
+                    cJSON_AddStringToObject(f, "file_data", part->url);
+                }
+            }
+        }
+        cJSON_AddItemToArray(content, b);
+    }
+}
+
+static int openaiEncodeMessage(const LlmmapiMessage* msg, cJSON* msgs)
+{
+    // Tool results become one "tool" message per result.
+    if (llmMessageHasPart(msg, LLMMAPI_PART_TOOL_RESULT) ||
+        strcmp(msg->role, LLMAPI_ROLE_TOOL) == 0)
+    {
+        for (size_t i = 0; i < msg->partCount; i++)
+        {
+            const LlmmapiPart* part = &msg->parts[i];
+            if (part->type != LLMMAPI_PART_TOOL_RESULT)
+            {
+                continue;
+            }
+
+            cJSON* m = cJSON_CreateObject();
+            if (m == NULL) return -1;
+            cJSON_AddStringToObject(m, "role", "tool");
+            cJSON_AddStringToObject(m, "tool_call_id",
+                                    part->toolCallId ? part->toolCallId : "");
+            cJSON_AddStringToObject(m, "content", part->text ? part->text : "");
+            cJSON_AddItemToArray(msgs, m);
+        }
+        return 0;
+    }
+
+    // Assistant tool calls.
+    if (llmMessageHasPart(msg, LLMMAPI_PART_TOOL_CALL))
+    {
+        cJSON* m = cJSON_CreateObject();
+        if (m == NULL) return -1;
+        cJSON_AddStringToObject(m, "role", "assistant");
+
+        char* text = llmConcatParts(msg, LLMMAPI_PART_TEXT);
+        if (text != NULL)
+        {
+            cJSON_AddStringToObject(m, "content", text);
+            free(text);
+        }
+        else
+        {
+            cJSON_AddNullToObject(m, "content");
+        }
+
+        cJSON* tcs = cJSON_AddArrayToObject(m, "tool_calls");
+        if (tcs != NULL)
+        {
+            for (size_t i = 0; i < msg->partCount; i++)
+            {
+                const LlmmapiPart* part = &msg->parts[i];
+                if (part->type != LLMMAPI_PART_TOOL_CALL)
+                {
+                    continue;
+                }
+
+                cJSON* tc = cJSON_CreateObject();
+                if (tc == NULL) continue;
+                cJSON_AddStringToObject(tc, "id",
+                                        part->toolCallId ? part->toolCallId : "");
+                cJSON_AddStringToObject(tc, "type", "function");
+                cJSON* fn = cJSON_AddObjectToObject(tc, "function");
+                if (fn != NULL)
+                {
+                    cJSON_AddStringToObject(fn, "name",
+                                            part->toolName ? part->toolName : "");
+                    cJSON_AddStringToObject(fn, "arguments",
+                                            part->text ? part->text : "{}");
+                }
+                cJSON_AddItemToArray(tcs, tc);
+            }
+        }
+
+        cJSON_AddItemToArray(msgs, m);
+        return 0;
+    }
+
+    // Ordinary message.
+    cJSON* m = cJSON_CreateObject();
+    if (m == NULL) return -1;
+    cJSON_AddStringToObject(m, "role", msg->role);
+
+    int hasMultipart = 0;
+    for (size_t i = 0; i < msg->partCount; i++)
+    {
+        LlmmapiPartType t = msg->parts[i].type;
+        if (t == LLMMAPI_PART_IMAGE || t == LLMMAPI_PART_FILE)
+        {
+            hasMultipart = 1;
+            break;
+        }
+    }
+
+    if (!hasMultipart)
+    {
+        char* text = llmConcatParts(msg, LLMMAPI_PART_TEXT);
+        cJSON_AddStringToObject(m, "content", text ? text : "");
+        free(text);
+    }
+    else
+    {
+        cJSON* content = cJSON_AddArrayToObject(m, "content");
+        if (content != NULL)
+        {
+            for (size_t i = 0; i < msg->partCount; i++)
+            {
+                openaiAddContentPart(content, &msg->parts[i]);
+            }
+        }
+    }
+
+    cJSON_AddItemToArray(msgs, m);
+
+    return 0;
+}
+
+static void openaiAddTools(const LlmmapiReq* req, cJSON* root)
+{
+    if (req->toolCount == 0)
+    {
+        return;
+    }
+
+    cJSON* tools = cJSON_AddArrayToObject(root, "tools");
+    if (tools == NULL)
+    {
+        return;
+    }
+
+    for (size_t i = 0; i < req->toolCount; i++)
+    {
+        const LlmTool* tool = &req->tools[i];
+
+        cJSON* t = cJSON_CreateObject();
+        if (t == NULL) continue;
+        cJSON_AddStringToObject(t, "type", "function");
+        cJSON* fn = cJSON_AddObjectToObject(t, "function");
+        if (fn != NULL)
+        {
+            cJSON_AddStringToObject(fn, "name", tool->name ? tool->name : "");
+            if (tool->description != NULL)
+            {
+                cJSON_AddStringToObject(fn, "description", tool->description);
+            }
+
+            cJSON* schema = tool->parametersJson
+                                ? cJSON_Parse(tool->parametersJson)
+                                : NULL;
+            if (schema == NULL)
+            {
+                schema = cJSON_CreateObject();
+            }
+            if (schema != NULL)
+            {
+                cJSON_AddItemToObject(fn, "parameters", schema);
+            }
+        }
+        cJSON_AddItemToArray(tools, t);
+    }
+}
+
+static void llmAddCommonParams(const LlmmapiReq* req, cJSON* root, int stream,
+                               const char* stopKey)
+{
+    cJSON_AddBoolToObject(root, "stream", stream ? 1 : 0);
+
+    if (req->hasMaxTokens)
+    {
+        cJSON_AddNumberToObject(root, "max_tokens", (double)req->maxTokens);
+    }
+
+    if (req->hasTemperature)
+    {
+        cJSON_AddNumberToObject(root, "temperature", req->temperature);
+    }
+
+    if (req->hasTopP)
+    {
+        cJSON_AddNumberToObject(root, "top_p", req->topP);
+    }
+
+    if (req->stopJson != NULL)
+    {
+        cJSON* stop = cJSON_Parse(req->stopJson);
+        if (stop != NULL)
+        {
+            cJSON_AddItemToObject(root, stopKey, stop);
+        }
+    }
+
+    for (size_t i = 0; i < req->extraCount; i++)
+    {
+        llmAddJsonValue(root, req->extraKeys[i], req->extraValues[i]);
+    }
+}
+
+static int openaiEncode(LlmmapiCtx* ctx, const LlmmapiReq* req, int stream,
+                        LlmBuf* body)
+{
+    (void)ctx;
+
     cJSON* root = cJSON_CreateObject();
     if (root == NULL)
     {
@@ -673,126 +1239,1338 @@ static int llmapiBuildRequestBody(const LlmmapiReq* req, int stream, LlmBuf* out
         return -1;
     }
 
-    for (size_t i = 0; i < req->msgCount; i++)
+    for (size_t i = 0; i < req->messageCount; i++)
     {
-        const LlmMsg* msg = &req->msgs[i];
-
-        cJSON* item = cJSON_CreateObject();
-        if (item == NULL)
+        if (openaiEncodeMessage(req->messages[i], msgs) != 0)
         {
             cJSON_Delete(root);
             return -1;
         }
-        cJSON_AddStringToObject(item, "role", msg->role);
+    }
 
-        if (msg->contentIsJson)
+    openaiAddTools(req, root);
+
+    llmAddCommonParams(req, root, stream, "stop");
+
+    char* json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (json == NULL)
+    {
+        return -1;
+    }
+
+    int rc = llmBufAppend(body, json);
+    free(json);
+
+    return rc;
+}
+
+static int openaiDecode(LlmmapiCtx* ctx, const char* rawJson, LlmmapiResp* out)
+{
+    (void)ctx;
+    cJSON* root = cJSON_Parse(rawJson);
+    if (root == NULL)
+    {
+        return -1;
+    }
+
+    out->rawJson = llmStrDup(rawJson);
+
+    cJSON* choices = cJSON_GetObjectItem(root, "choices");
+    if (choices != NULL && cJSON_IsArray(choices) &&
+        cJSON_GetArraySize(choices) > 0)
+    {
+        cJSON* choice  = cJSON_GetArrayItem(choices, 0);
+        cJSON* message = cJSON_GetObjectItem(choice, "message");
+
+        if (message != NULL)
         {
-            cJSON* parts = cJSON_Parse(msg->content);
-            if (parts == NULL || !cJSON_IsArray(parts))
+            cJSON* content = cJSON_GetObjectItem(message, "content");
+            if (content != NULL && cJSON_IsString(content))
             {
-                cJSON_Delete(parts);
-                cJSON_Delete(item);
+                llmAddTextPart(&out->message, LLMMAPI_PART_TEXT,
+                               content->valuestring);
+            }
+            else if (content != NULL && cJSON_IsArray(content))
+            {
+                cJSON* part = NULL;
+                cJSON_ArrayForEach(part, content)
+                {
+                    const char* type = llmJsonStr(part, "type");
+                    if (type != NULL && strcmp(type, "text") == 0)
+                    {
+                        llmAddTextPart(&out->message, LLMMAPI_PART_TEXT,
+                                       llmJsonStr(part, "text"));
+                    }
+                }
+            }
+
+            const char* reasoning = llmJsonStr(message, "reasoning_content");
+            if (reasoning != NULL)
+            {
+                llmAddTextPart(&out->message, LLMMAPI_PART_THINKING, reasoning);
+            }
+
+            cJSON* tcs = cJSON_GetObjectItem(message, "tool_calls");
+            if (tcs != NULL && cJSON_IsArray(tcs))
+            {
+                cJSON* tc = NULL;
+                cJSON_ArrayForEach(tc, tcs)
+                {
+                    cJSON* fn = cJSON_GetObjectItem(tc, "function");
+
+                    LlmmapiPart* p = llmMessageNewPart(&out->message);
+                    if (p == NULL) continue;
+
+                    p->type       = LLMMAPI_PART_TOOL_CALL;
+                    p->toolCallId = llmStrDup(llmJsonStr(tc, "id"));
+                    p->toolName   = llmStrDup(fn ? llmJsonStr(fn, "name") : NULL);
+                    p->text       = llmStrDup(fn ? llmJsonStr(fn, "arguments")
+                                                 : NULL);
+                    if (p->text == NULL)
+                    {
+                        p->text = llmStrDup("{}");
+                    }
+                }
+            }
+        }
+
+        const char* finish = llmJsonStr(choice, "finish_reason");
+        if (finish != NULL)
+        {
+            out->finishReason = llmStrDup(finish);
+        }
+    }
+
+    cJSON* usage = cJSON_GetObjectItem(root, "usage");
+    long in = 0, outTok = 0, total = 0;
+    if (usage != NULL)
+    {
+        llmJsonLong(usage, "prompt_tokens", &in);
+        llmJsonLong(usage, "completion_tokens", &outTok);
+        if (!llmJsonLong(usage, "total_tokens", &total))
+        {
+            total = in + outTok;
+        }
+    }
+
+    out->inputTokens  = in;
+    out->outputTokens = outTok;
+    out->totalTokens  = total;
+
+    cJSON_Delete(root);
+
+    return 0;
+}
+
+static void openaiStreamDecode(const char* payload, LlmStreamSink* sink)
+{
+    if (strcmp(payload, "[DONE]") == 0)
+    {
+        sink->done = 1;
+        llmEmit(sink, LLMAPI_STREAM_DONE, NULL, NULL, NULL, 0);
+        return;
+    }
+
+    cJSON* root = cJSON_Parse(payload);
+    if (root == NULL)
+    {
+        return;
+    }
+
+    cJSON* choices = cJSON_GetObjectItem(root, "choices");
+    if (choices != NULL && cJSON_IsArray(choices) &&
+        cJSON_GetArraySize(choices) > 0)
+    {
+        cJSON* choice = cJSON_GetArrayItem(choices, 0);
+        cJSON* delta  = cJSON_GetObjectItem(choice, "delta");
+
+        if (delta != NULL)
+        {
+            const char* content = llmJsonStr(delta, "content");
+            if (content != NULL && content[0] != '\0')
+            {
+                llmEmit(sink, LLMAPI_STREAM_TEXT, content, NULL, NULL, 0);
+            }
+
+            const char* reasoning = llmJsonStr(delta, "reasoning_content");
+            if (reasoning != NULL && reasoning[0] != '\0')
+            {
+                llmEmit(sink, LLMAPI_STREAM_THINKING, reasoning, NULL, NULL, 0);
+            }
+
+            cJSON* tcs = cJSON_GetObjectItem(delta, "tool_calls");
+            if (tcs != NULL && cJSON_IsArray(tcs))
+            {
+                size_t fallback = 0;
+                cJSON* tc = NULL;
+                cJSON_ArrayForEach(tc, tcs)
+                {
+                    size_t index = fallback;
+                    cJSON* idx = cJSON_GetObjectItem(tc, "index");
+                    if (idx != NULL && cJSON_IsNumber(idx))
+                    {
+                        index = (size_t)idx->valuedouble;
+                    }
+                    fallback = index + 1;
+
+                    cJSON* fn = cJSON_GetObjectItem(tc, "function");
+                    const char* id   = llmJsonStr(tc, "id");
+                    const char* name = fn ? llmJsonStr(fn, "name") : NULL;
+                    const char* args = fn ? llmJsonStr(fn, "arguments") : NULL;
+
+                    llmEmit(sink, LLMAPI_STREAM_TOOL_CALL, args, id, name,
+                            index);
+                }
+            }
+        }
+    }
+
+    cJSON* usage = cJSON_GetObjectItem(root, "usage");
+    if (usage != NULL)
+    {
+        long in = 0, outTok = 0;
+        if (llmJsonLong(usage, "prompt_tokens", &in))
+        {
+            sink->inputTokens = in;
+        }
+        if (llmJsonLong(usage, "completion_tokens", &outTok))
+        {
+            sink->outputTokens = outTok;
+        }
+    }
+
+    cJSON_Delete(root);
+}
+
+// ==================== Provider: Anthropic ====================
+
+static int anthropicAddImage(cJSON* content, const LlmmapiPart* part)
+{
+    if (part->url == NULL)
+    {
+        return -1;
+    }
+
+    cJSON* block = cJSON_CreateObject();
+    if (block == NULL)
+    {
+        return -1;
+    }
+    cJSON_AddStringToObject(block, "type", "image");
+
+    cJSON* source = cJSON_AddObjectToObject(block, "source");
+    if (source == NULL)
+    {
+        cJSON_Delete(block);
+        return -1;
+    }
+
+    char* mime = NULL;
+    const char* data = NULL;
+    if (llmParseDataUrl(part->url, &mime, &data))
+    {
+        cJSON_AddStringToObject(source, "type", "base64");
+        cJSON_AddStringToObject(source, "media_type", mime);
+        cJSON_AddStringToObject(source, "data", data);
+        free(mime);
+    }
+    else
+    {
+        cJSON_AddStringToObject(source, "type", "url");
+        cJSON_AddStringToObject(source, "url", part->url);
+    }
+
+    cJSON_AddItemToArray(content, block);
+
+    return 0;
+}
+
+static int anthropicAddFile(cJSON* content, const LlmmapiPart* part)
+{
+    // Anthropic has no provider-side file id source; require an inline data URL.
+    if (part->url == NULL)
+    {
+        return -1;
+    }
+
+    char* mime = NULL;
+    const char* data = NULL;
+    if (!llmParseDataUrl(part->url, &mime, &data))
+    {
+        return -1;
+    }
+
+    cJSON* block = cJSON_CreateObject();
+    if (block == NULL)
+    {
+        free(mime);
+        return -1;
+    }
+    cJSON_AddStringToObject(block, "type", "document");
+
+    cJSON* source = cJSON_AddObjectToObject(block, "source");
+    if (source == NULL)
+    {
+        free(mime);
+        cJSON_Delete(block);
+        return -1;
+    }
+
+    cJSON_AddStringToObject(source, "type", "base64");
+    cJSON_AddStringToObject(source, "media_type", mime);
+    cJSON_AddStringToObject(source, "data", data);
+
+    free(mime);
+
+    cJSON_AddItemToArray(content, block);
+
+    return 0;
+}
+
+static int anthropicEncodeMessage(LlmmapiCtx* ctx, const LlmmapiMessage* msg,
+                                  cJSON* msgs)
+{
+    int isTool = (strcmp(msg->role, LLMAPI_ROLE_TOOL) == 0) ||
+                 llmMessageHasPart(msg, LLMMAPI_PART_TOOL_RESULT);
+
+    if (isTool)
+    {
+        // Handled by the caller (which merges consecutive tool messages).
+        (void)ctx;
+        return 0;
+    }
+
+    cJSON* m = cJSON_CreateObject();
+    if (m == NULL)
+    {
+        return -1;
+    }
+
+    const char* role = (strcmp(msg->role, LLMAPI_ROLE_ASSISTANT) == 0)
+                           ? "assistant"
+                           : "user";
+    cJSON_AddStringToObject(m, "role", role);
+
+    cJSON* content = cJSON_AddArrayToObject(m, "content");
+    if (content == NULL)
+    {
+        cJSON_Delete(m);
+        return -1;
+    }
+
+    for (size_t i = 0; i < msg->partCount; i++)
+    {
+        const LlmmapiPart* part = &msg->parts[i];
+
+        if (part->type == LLMMAPI_PART_TEXT)
+        {
+            cJSON* b = cJSON_CreateObject();
+            if (b == NULL) continue;
+            cJSON_AddStringToObject(b, "type", "text");
+            cJSON_AddStringToObject(b, "text", part->text ? part->text : "");
+            cJSON_AddItemToArray(content, b);
+        }
+        else if (part->type == LLMMAPI_PART_IMAGE)
+        {
+            if (anthropicAddImage(content, part) != 0)
+            {
+                llmBufAppend(&ctx->errbuf,
+                             "Anthropic: image part needs a url");
+                cJSON_Delete(m);
+                return -1;
+            }
+        }
+        else if (part->type == LLMMAPI_PART_FILE)
+        {
+            if (anthropicAddFile(content, part) != 0)
+            {
+                llmBufAppend(&ctx->errbuf,
+                             "Anthropic: file part needs an inline data URL");
+                cJSON_Delete(m);
+                return -1;
+            }
+        }
+        else if (part->type == LLMMAPI_PART_TOOL_CALL)
+        {
+            cJSON* b = cJSON_CreateObject();
+            if (b == NULL) continue;
+            cJSON_AddStringToObject(b, "type", "tool_use");
+            cJSON_AddStringToObject(b, "id",
+                                    part->toolCallId ? part->toolCallId : "");
+            cJSON_AddStringToObject(b, "name",
+                                    part->toolName ? part->toolName : "");
+
+            cJSON* input = part->text ? cJSON_Parse(part->text) : NULL;
+            if (input == NULL)
+            {
+                input = cJSON_CreateObject();
+            }
+            if (input != NULL)
+            {
+                cJSON_AddItemToObject(b, "input", input);
+            }
+
+            cJSON_AddItemToArray(content, b);
+        }
+        // THINKING and TOOL_RESULT are not sent back as input.
+    }
+
+    cJSON_AddItemToArray(msgs, m);
+
+    return 0;
+}
+
+static void anthropicAddTools(const LlmmapiReq* req, cJSON* root)
+{
+    if (req->toolCount == 0)
+    {
+        return;
+    }
+
+    cJSON* tools = cJSON_AddArrayToObject(root, "tools");
+    if (tools == NULL)
+    {
+        return;
+    }
+
+    for (size_t i = 0; i < req->toolCount; i++)
+    {
+        const LlmTool* tool = &req->tools[i];
+
+        cJSON* t = cJSON_CreateObject();
+        if (t == NULL) continue;
+        cJSON_AddStringToObject(t, "name", tool->name ? tool->name : "");
+        if (tool->description != NULL)
+        {
+            cJSON_AddStringToObject(t, "description", tool->description);
+        }
+
+        cJSON* schema = tool->parametersJson
+                            ? cJSON_Parse(tool->parametersJson)
+                            : NULL;
+        if (schema == NULL)
+        {
+            schema = cJSON_CreateObject();
+        }
+        if (schema != NULL)
+        {
+            cJSON_AddItemToObject(t, "input_schema", schema);
+        }
+
+        cJSON_AddItemToArray(tools, t);
+    }
+}
+
+static int anthropicEncode(LlmmapiCtx* ctx, const LlmmapiReq* req, int stream,
+                           LlmBuf* body)
+{
+    cJSON* root = cJSON_CreateObject();
+    if (root == NULL)
+    {
+        return -1;
+    }
+
+    cJSON_AddStringToObject(root, "model", req->model);
+
+    // System prompt is a top-level field in the Anthropic API.
+    LlmBuf system;
+    llmBufInit(&system);
+    for (size_t i = 0; i < req->messageCount; i++)
+    {
+        const LlmmapiMessage* msg = req->messages[i];
+        if (strcmp(msg->role, LLMAPI_ROLE_SYSTEM) != 0)
+        {
+            continue;
+        }
+
+        for (size_t j = 0; j < msg->partCount; j++)
+        {
+            if (msg->parts[j].type == LLMMAPI_PART_TEXT &&
+                msg->parts[j].text != NULL)
+            {
+                if (system.len > 0)
+                {
+                    llmBufAppend(&system, "\n\n");
+                }
+                llmBufAppend(&system, msg->parts[j].text);
+            }
+        }
+    }
+    if (system.len > 0)
+    {
+        cJSON_AddStringToObject(root, "system", system.data);
+    }
+    llmBufFree(&system);
+
+    cJSON* msgs = cJSON_AddArrayToObject(root, "messages");
+    if (msgs == NULL)
+    {
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    for (size_t i = 0; i < req->messageCount; i++)
+    {
+        const LlmmapiMessage* msg = req->messages[i];
+
+        if (strcmp(msg->role, LLMAPI_ROLE_SYSTEM) == 0)
+        {
+            continue;
+        }
+
+        int isTool = (strcmp(msg->role, LLMAPI_ROLE_TOOL) == 0) ||
+                     llmMessageHasPart(msg, LLMMAPI_PART_TOOL_RESULT);
+
+        if (isTool)
+        {
+            // Merge consecutive tool-result messages into one user message.
+            cJSON* m = cJSON_CreateObject();
+            if (m == NULL)
+            {
                 cJSON_Delete(root);
                 return -1;
             }
-            cJSON_AddItemToObject(item, "content", parts);
-        }
-        else if (msg->toolCallsJson)
-        {
-            cJSON* tcs = cJSON_Parse(msg->toolCallsJson);
-            if (tcs)
+            cJSON_AddStringToObject(m, "role", "user");
+            cJSON* content = cJSON_AddArrayToObject(m, "content");
+            if (content == NULL)
             {
-                cJSON_AddItemToObject(item, "tool_calls", tcs);
-                cJSON_AddNullToObject(item, "content");
+                cJSON_Delete(m);
+                cJSON_Delete(root);
+                return -1;
             }
-            else
+
+            size_t j = i;
+            while (j < req->messageCount)
             {
-                cJSON_AddStringToObject(item, "content", "");
+                const LlmmapiMessage* tm = req->messages[j];
+                int tj = (strcmp(tm->role, LLMAPI_ROLE_TOOL) == 0) ||
+                         llmMessageHasPart(tm, LLMMAPI_PART_TOOL_RESULT);
+                if (!tj)
+                {
+                    break;
+                }
+
+                for (size_t k = 0; k < tm->partCount; k++)
+                {
+                    const LlmmapiPart* part = &tm->parts[k];
+                    if (part->type != LLMMAPI_PART_TOOL_RESULT)
+                    {
+                        continue;
+                    }
+
+                    cJSON* tr = cJSON_CreateObject();
+                    if (tr == NULL) continue;
+                    cJSON_AddStringToObject(tr, "type", "tool_result");
+                    cJSON_AddStringToObject(tr, "tool_use_id",
+                                            part->toolCallId
+                                                ? part->toolCallId
+                                                : "");
+                    cJSON_AddStringToObject(tr, "content",
+                                            part->text ? part->text : "");
+                    cJSON_AddItemToArray(content, tr);
+                }
+                j++;
             }
-        }
-        else if (msg->toolCallId)
-        {
-            cJSON_AddStringToObject(item, "tool_call_id", msg->toolCallId);
-            if (msg->toolCallName)
-            {
-                cJSON_AddStringToObject(item, "name", msg->toolCallName);
-            }
-            cJSON_AddStringToObject(item, "content", msg->content);
-        }
-        else
-        {
-            cJSON_AddStringToObject(item, "content", msg->content);
+
+            i = j - 1;
+            cJSON_AddItemToArray(msgs, m);
+            continue;
         }
 
-        cJSON_AddItemToArray(msgs, item);
+        if (anthropicEncodeMessage(ctx, msg, msgs) != 0)
+        {
+            cJSON_Delete(root);
+            return -1;
+        }
     }
 
-    cJSON_AddBoolToObject(root, "stream", stream ? 1 : 0);
+    anthropicAddTools(req, root);
 
+    // max_tokens is required by the Anthropic API.
     if (req->hasMaxTokens)
     {
         cJSON_AddNumberToObject(root, "max_tokens", (double)req->maxTokens);
+    }
+    else
+    {
+        cJSON_AddNumberToObject(root, "max_tokens",
+                                (double)LLMAPI_DEFAULT_MAX_TOKENS);
     }
 
     if (req->hasTemperature)
     {
         cJSON_AddNumberToObject(root, "temperature", req->temperature);
     }
-
-    for (size_t i = 0; i < req->extraCount; i++)
+    if (req->hasTopP)
     {
-        cJSON* val = cJSON_Parse(req->extraValues[i]);
-        if (val == NULL)
+        cJSON_AddNumberToObject(root, "top_p", req->topP);
+    }
+    if (req->stopJson != NULL)
+    {
+        cJSON* stop = cJSON_Parse(req->stopJson);
+        if (stop != NULL)
         {
-            val = cJSON_CreateString(req->extraValues[i]);
-        }
-
-        if (val != NULL)
-        {
-            cJSON_AddItemToObject(root, req->extraKeys[i], val);
+            cJSON_AddItemToObject(root, "stop_sequences", stop);
         }
     }
 
-    char* jsonStr = cJSON_PrintUnformatted(root);
+    cJSON_AddBoolToObject(root, "stream", stream ? 1 : 0);
+
+    for (size_t i = 0; i < req->extraCount; i++)
+    {
+        llmAddJsonValue(root, req->extraKeys[i], req->extraValues[i]);
+    }
+
+    char* json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
 
-    if (jsonStr == NULL)
+    if (json == NULL)
     {
         return -1;
     }
 
-    int ok = llmBufAppend(out, jsonStr);
-    free(jsonStr);
+    int rc = llmBufAppend(body, json);
+    free(json);
 
-    return ok;
+    return rc;
 }
 
-// ==================== Internal: Chunk Collector ====================
-
-// Append every received chunk to a buffer (used by the sync path).
-static int llmCollectChunk(const void* data, size_t len, void* userdata)
+static int anthropicDecode(LlmmapiCtx* ctx, const char* rawJson,
+                           LlmmapiResp* out)
 {
-    LlmBuf* buf = (LlmBuf*)userdata;
-
-    if (llmBufGrow(buf, buf->len + len + 1) != 0)
+    (void)ctx;
+    cJSON* root = cJSON_Parse(rawJson);
+    if (root == NULL)
     {
-        return 0;
+        return -1;
     }
 
-    if (len > 0)
-    {
-        memcpy(buf->data + buf->len, data, len);
-        buf->len += len;
-    }
-    buf->data[buf->len] = '\0';
+    out->rawJson = llmStrDup(rawJson);
 
-    return 1;
+    cJSON* content = cJSON_GetObjectItem(root, "content");
+    if (content != NULL && cJSON_IsArray(content))
+    {
+        cJSON* block = NULL;
+        cJSON_ArrayForEach(block, content)
+        {
+            const char* type = llmJsonStr(block, "type");
+            if (type == NULL)
+            {
+                continue;
+            }
+
+            if (strcmp(type, "text") == 0)
+            {
+                llmAddTextPart(&out->message, LLMMAPI_PART_TEXT,
+                               llmJsonStr(block, "text"));
+            }
+            else if (strcmp(type, "thinking") == 0)
+            {
+                llmAddTextPart(&out->message, LLMMAPI_PART_THINKING,
+                               llmJsonStr(block, "thinking"));
+            }
+            else if (strcmp(type, "tool_use") == 0)
+            {
+                LlmmapiPart* p = llmMessageNewPart(&out->message);
+                if (p == NULL) continue;
+
+                p->type       = LLMMAPI_PART_TOOL_CALL;
+                p->toolCallId = llmStrDup(llmJsonStr(block, "id"));
+                p->toolName   = llmStrDup(llmJsonStr(block, "name"));
+
+                cJSON* input = cJSON_GetObjectItem(block, "input");
+                p->text = input ? cJSON_PrintUnformatted(input)
+                                : llmStrDup("{}");
+                if (p->text == NULL)
+                {
+                    p->text = llmStrDup("{}");
+                }
+            }
+        }
+    }
+
+    const char* stop = llmJsonStr(root, "stop_reason");
+    if (stop != NULL)
+    {
+        out->finishReason = llmStrDup(stop);
+    }
+
+    cJSON* usage = cJSON_GetObjectItem(root, "usage");
+    long in = 0, outTok = 0;
+    if (usage != NULL)
+    {
+        llmJsonLong(usage, "input_tokens", &in);
+        llmJsonLong(usage, "output_tokens", &outTok);
+    }
+
+    out->inputTokens  = in;
+    out->outputTokens = outTok;
+    out->totalTokens  = in + outTok;
+
+    cJSON_Delete(root);
+
+    return 0;
 }
 
-// ==================== Internal: Request Assembly ====================
+static void anthropicStreamDecode(const char* payload, LlmStreamSink* sink)
+{
+    cJSON* root = cJSON_Parse(payload);
+    if (root == NULL)
+    {
+        return;
+    }
 
-// Append `path` to `baseUrl`, avoiding a doubled '/' at the join.
-static int llmapiJoinUrl(LlmBuf* out, const char* baseUrl, const char* path)
+    const char* type = llmJsonStr(root, "type");
+    if (type == NULL)
+    {
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (strcmp(type, "message_start") == 0)
+    {
+        cJSON* message = cJSON_GetObjectItem(root, "message");
+        cJSON* usage   = message ? cJSON_GetObjectItem(message, "usage") : NULL;
+        long in = 0;
+        if (usage != NULL && llmJsonLong(usage, "input_tokens", &in))
+        {
+            sink->inputTokens = in;
+        }
+    }
+    else if (strcmp(type, "content_block_start") == 0)
+    {
+        cJSON* block = cJSON_GetObjectItem(root, "content_block");
+        size_t index = 0;
+        cJSON* idx = cJSON_GetObjectItem(root, "index");
+        if (idx != NULL && cJSON_IsNumber(idx))
+        {
+            index = (size_t)idx->valuedouble;
+        }
+
+        const char* btype = block ? llmJsonStr(block, "type") : NULL;
+        if (btype != NULL && strcmp(btype, "tool_use") == 0)
+        {
+            llmEmit(sink, LLMAPI_STREAM_TOOL_CALL, NULL,
+                    llmJsonStr(block, "id"), llmJsonStr(block, "name"),
+                    index);
+        }
+    }
+    else if (strcmp(type, "content_block_delta") == 0)
+    {
+        cJSON* delta = cJSON_GetObjectItem(root, "delta");
+        size_t index = 0;
+        cJSON* idx = cJSON_GetObjectItem(root, "index");
+        if (idx != NULL && cJSON_IsNumber(idx))
+        {
+            index = (size_t)idx->valuedouble;
+        }
+
+        const char* dtype = delta ? llmJsonStr(delta, "type") : NULL;
+        if (dtype == NULL)
+        {
+            // nothing
+        }
+        else if (strcmp(dtype, "text_delta") == 0)
+        {
+            llmEmit(sink, LLMAPI_STREAM_TEXT, llmJsonStr(delta, "text"),
+                    NULL, NULL, index);
+        }
+        else if (strcmp(dtype, "thinking_delta") == 0)
+        {
+            llmEmit(sink, LLMAPI_STREAM_THINKING,
+                    llmJsonStr(delta, "thinking"), NULL, NULL, index);
+        }
+        else if (strcmp(dtype, "input_json_delta") == 0)
+        {
+            llmEmit(sink, LLMAPI_STREAM_TOOL_CALL,
+                    llmJsonStr(delta, "partial_json"), NULL, NULL, index);
+        }
+    }
+    else if (strcmp(type, "message_delta") == 0)
+    {
+        cJSON* usage = cJSON_GetObjectItem(root, "usage");
+        long outTok = 0;
+        if (usage != NULL && llmJsonLong(usage, "output_tokens", &outTok))
+        {
+            sink->outputTokens = outTok;
+        }
+    }
+    else if (strcmp(type, "message_stop") == 0)
+    {
+        sink->done = 1;
+        llmEmit(sink, LLMAPI_STREAM_DONE, NULL, NULL, NULL, 0);
+    }
+
+    cJSON_Delete(root);
+}
+
+// ==================== Provider: OpenAI Responses ====================
+
+static void responsesAddInputPart(cJSON* content, const LlmmapiPart* part)
+{
+    if (part->type == LLMMAPI_PART_TEXT)
+    {
+        cJSON* b = cJSON_CreateObject();
+        if (b == NULL) return;
+        cJSON_AddStringToObject(b, "type", "input_text");
+        cJSON_AddStringToObject(b, "text", part->text ? part->text : "");
+        cJSON_AddItemToArray(content, b);
+    }
+    else if (part->type == LLMMAPI_PART_IMAGE)
+    {
+        cJSON* b = cJSON_CreateObject();
+        if (b == NULL) return;
+        cJSON_AddStringToObject(b, "type", "input_image");
+        if (part->fileId != NULL)
+        {
+            cJSON_AddStringToObject(b, "file_id", part->fileId);
+        }
+        else
+        {
+            cJSON_AddStringToObject(b, "image_url",
+                                    part->url ? part->url : "");
+        }
+        cJSON_AddItemToArray(content, b);
+    }
+    else if (part->type == LLMMAPI_PART_FILE)
+    {
+        cJSON* b = cJSON_CreateObject();
+        if (b == NULL) return;
+        cJSON_AddStringToObject(b, "type", "input_file");
+        if (part->fileId != NULL)
+        {
+            cJSON_AddStringToObject(b, "file_id", part->fileId);
+        }
+        else
+        {
+            if (part->filename != NULL)
+            {
+                cJSON_AddStringToObject(b, "filename", part->filename);
+            }
+            if (part->url != NULL)
+            {
+                cJSON_AddStringToObject(b, "file_data", part->url);
+            }
+        }
+        cJSON_AddItemToArray(content, b);
+    }
+}
+
+static int responsesEncode(LlmmapiCtx* ctx, const LlmmapiReq* req, int stream,
+                           LlmBuf* body)
+{
+    (void)ctx;
+
+    cJSON* root = cJSON_CreateObject();
+    if (root == NULL)
+    {
+        return -1;
+    }
+
+    cJSON_AddStringToObject(root, "model", req->model);
+
+    // System messages become the top-level "instructions" field.
+    LlmBuf instructions;
+    llmBufInit(&instructions);
+    for (size_t i = 0; i < req->messageCount; i++)
+    {
+        const LlmmapiMessage* msg = req->messages[i];
+        if (strcmp(msg->role, LLMAPI_ROLE_SYSTEM) != 0)
+        {
+            continue;
+        }
+
+        for (size_t j = 0; j < msg->partCount; j++)
+        {
+            if (msg->parts[j].type == LLMMAPI_PART_TEXT &&
+                msg->parts[j].text != NULL)
+            {
+                if (instructions.len > 0)
+                {
+                    llmBufAppend(&instructions, "\n\n");
+                }
+                llmBufAppend(&instructions, msg->parts[j].text);
+            }
+        }
+    }
+    if (instructions.len > 0)
+    {
+        cJSON_AddStringToObject(root, "instructions", instructions.data);
+    }
+    llmBufFree(&instructions);
+
+    cJSON* input = cJSON_AddArrayToObject(root, "input");
+    if (input == NULL)
+    {
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    for (size_t i = 0; i < req->messageCount; i++)
+    {
+        const LlmmapiMessage* msg = req->messages[i];
+
+        if (strcmp(msg->role, LLMAPI_ROLE_SYSTEM) == 0)
+        {
+            continue;
+        }
+
+        // Tool results are top-level function_call_output items.
+        if (strcmp(msg->role, LLMAPI_ROLE_TOOL) == 0 ||
+            llmMessageHasPart(msg, LLMMAPI_PART_TOOL_RESULT))
+        {
+            for (size_t j = 0; j < msg->partCount; j++)
+            {
+                const LlmmapiPart* part = &msg->parts[j];
+                if (part->type != LLMMAPI_PART_TOOL_RESULT)
+                {
+                    continue;
+                }
+
+                cJSON* item = cJSON_CreateObject();
+                if (item == NULL) continue;
+                cJSON_AddStringToObject(item, "type", "function_call_output");
+                cJSON_AddStringToObject(item, "call_id",
+                                        part->toolCallId ? part->toolCallId
+                                                         : "");
+                cJSON_AddStringToObject(item, "output",
+                                        part->text ? part->text : "");
+                cJSON_AddItemToArray(input, item);
+            }
+            continue;
+        }
+
+        // Assistant tool calls are top-level function_call items.
+        if (llmMessageHasPart(msg, LLMMAPI_PART_TOOL_CALL))
+        {
+            char* text = llmConcatParts(msg, LLMMAPI_PART_TEXT);
+            if (text != NULL && text[0] != '\0')
+            {
+                cJSON* item = cJSON_CreateObject();
+                if (item != NULL)
+                {
+                    cJSON_AddStringToObject(item, "role", "assistant");
+                    cJSON* content = cJSON_AddArrayToObject(item, "content");
+                    if (content != NULL)
+                    {
+                        cJSON* b = cJSON_CreateObject();
+                        if (b != NULL)
+                        {
+                            cJSON_AddStringToObject(b, "type", "input_text");
+                            cJSON_AddStringToObject(b, "text", text);
+                            cJSON_AddItemToArray(content, b);
+                        }
+                    }
+                    cJSON_AddItemToArray(input, item);
+                }
+            }
+            free(text);
+
+            for (size_t j = 0; j < msg->partCount; j++)
+            {
+                const LlmmapiPart* part = &msg->parts[j];
+                if (part->type != LLMMAPI_PART_TOOL_CALL)
+                {
+                    continue;
+                }
+
+                cJSON* item = cJSON_CreateObject();
+                if (item == NULL) continue;
+                cJSON_AddStringToObject(item, "type", "function_call");
+                cJSON_AddStringToObject(item, "call_id",
+                                        part->toolCallId ? part->toolCallId
+                                                         : "");
+                cJSON_AddStringToObject(item, "name",
+                                        part->toolName ? part->toolName : "");
+                cJSON_AddStringToObject(item, "arguments",
+                                        part->text ? part->text : "{}");
+                cJSON_AddItemToArray(input, item);
+            }
+            continue;
+        }
+
+        // Ordinary message.
+        cJSON* item = cJSON_CreateObject();
+        if (item == NULL) continue;
+
+        const char* role = (strcmp(msg->role, LLMAPI_ROLE_ASSISTANT) == 0)
+                               ? "assistant"
+                               : "user";
+        cJSON_AddStringToObject(item, "role", role);
+
+        int hasMultipart = 0;
+        for (size_t j = 0; j < msg->partCount; j++)
+        {
+            LlmmapiPartType t = msg->parts[j].type;
+            if (t == LLMMAPI_PART_IMAGE || t == LLMMAPI_PART_FILE)
+            {
+                hasMultipart = 1;
+                break;
+            }
+        }
+
+        if (!hasMultipart)
+        {
+            char* text = llmConcatParts(msg, LLMMAPI_PART_TEXT);
+            cJSON_AddStringToObject(item, "content", text ? text : "");
+            free(text);
+        }
+        else
+        {
+            cJSON* content = cJSON_AddArrayToObject(item, "content");
+            if (content != NULL)
+            {
+                for (size_t j = 0; j < msg->partCount; j++)
+                {
+                    responsesAddInputPart(content, &msg->parts[j]);
+                }
+            }
+        }
+
+        cJSON_AddItemToArray(input, item);
+    }
+
+    // Tools use the flat Responses schema (no nested "function" object).
+    if (req->toolCount > 0)
+    {
+        cJSON* tools = cJSON_AddArrayToObject(root, "tools");
+        if (tools != NULL)
+        {
+            for (size_t i = 0; i < req->toolCount; i++)
+            {
+                const LlmTool* tool = &req->tools[i];
+
+                cJSON* t = cJSON_CreateObject();
+                if (t == NULL) continue;
+                cJSON_AddStringToObject(t, "type", "function");
+                cJSON_AddStringToObject(t, "name",
+                                        tool->name ? tool->name : "");
+                if (tool->description != NULL)
+                {
+                    cJSON_AddStringToObject(t, "description",
+                                            tool->description);
+                }
+
+                cJSON* schema = tool->parametersJson
+                                    ? cJSON_Parse(tool->parametersJson)
+                                    : NULL;
+                if (schema == NULL)
+                {
+                    schema = cJSON_CreateObject();
+                }
+                if (schema != NULL)
+                {
+                    cJSON_AddItemToObject(t, "parameters", schema);
+                }
+
+                cJSON_AddItemToArray(tools, t);
+            }
+        }
+    }
+
+    if (req->hasMaxTokens)
+    {
+        cJSON_AddNumberToObject(root, "max_output_tokens",
+                                (double)req->maxTokens);
+    }
+    if (req->hasTemperature)
+    {
+        cJSON_AddNumberToObject(root, "temperature", req->temperature);
+    }
+    if (req->hasTopP)
+    {
+        cJSON_AddNumberToObject(root, "top_p", req->topP);
+    }
+
+    // Note: the Responses API has no "stop" parameter; llmapiReqSetStop() is
+    // intentionally ignored for this provider.
+
+    cJSON_AddBoolToObject(root, "stream", stream ? 1 : 0);
+
+    for (size_t i = 0; i < req->extraCount; i++)
+    {
+        llmAddJsonValue(root, req->extraKeys[i], req->extraValues[i]);
+    }
+
+    char* json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (json == NULL)
+    {
+        return -1;
+    }
+
+    int rc = llmBufAppend(body, json);
+    free(json);
+
+    return rc;
+}
+
+static int responsesDecode(LlmmapiCtx* ctx, const char* rawJson,
+                           LlmmapiResp* out)
+{
+    cJSON* root = cJSON_Parse(rawJson);
+    if (root == NULL)
+    {
+        return -1;
+    }
+
+    out->rawJson = llmStrDup(rawJson);
+
+    cJSON* output = cJSON_GetObjectItem(root, "output");
+    if (output != NULL && cJSON_IsArray(output))
+    {
+        cJSON* item = NULL;
+        cJSON_ArrayForEach(item, output)
+        {
+            const char* type = llmJsonStr(item, "type");
+            if (type == NULL)
+            {
+                continue;
+            }
+
+            if (strcmp(type, "message") == 0)
+            {
+                cJSON* content = cJSON_GetObjectItem(item, "content");
+                if (content != NULL && cJSON_IsArray(content))
+                {
+                    cJSON* part = NULL;
+                    cJSON_ArrayForEach(part, content)
+                    {
+                        const char* ptype = llmJsonStr(part, "type");
+                        if (ptype != NULL &&
+                            strcmp(ptype, "output_text") == 0)
+                        {
+                            llmAddTextPart(&out->message, LLMMAPI_PART_TEXT,
+                                           llmJsonStr(part, "text"));
+                        }
+                    }
+                }
+            }
+            else if (strcmp(type, "function_call") == 0)
+            {
+                LlmmapiPart* p = llmMessageNewPart(&out->message);
+                if (p == NULL) continue;
+
+                p->type       = LLMMAPI_PART_TOOL_CALL;
+                p->toolCallId = llmStrDup(llmJsonStr(item, "call_id"));
+                p->toolName   = llmStrDup(llmJsonStr(item, "name"));
+                p->text       = llmStrDup(llmJsonStr(item, "arguments"));
+                if (p->text == NULL)
+                {
+                    p->text = llmStrDup("{}");
+                }
+            }
+            else if (strcmp(type, "reasoning") == 0)
+            {
+                cJSON* summary = cJSON_GetObjectItem(item, "summary");
+                if (summary != NULL && cJSON_IsArray(summary))
+                {
+                    cJSON* s = NULL;
+                    cJSON_ArrayForEach(s, summary)
+                    {
+                        llmAddTextPart(&out->message, LLMMAPI_PART_THINKING,
+                                       llmJsonStr(s, "text"));
+                    }
+                }
+
+                cJSON* content = cJSON_GetObjectItem(item, "content");
+                if (content != NULL && cJSON_IsArray(content))
+                {
+                    cJSON* c = NULL;
+                    cJSON_ArrayForEach(c, content)
+                    {
+                        llmAddTextPart(&out->message, LLMMAPI_PART_THINKING,
+                                       llmJsonStr(c, "text"));
+                    }
+                }
+            }
+        }
+    }
+
+    const char* status = llmJsonStr(root, "status");
+    if (status != NULL)
+    {
+        out->finishReason = llmStrDup(status);
+    }
+
+    cJSON* incomplete = cJSON_GetObjectItem(root, "incomplete_details");
+    if (incomplete != NULL)
+    {
+        const char* reason = llmJsonStr(incomplete, "reason");
+        if (reason != NULL)
+        {
+            free(out->finishReason);
+            out->finishReason = llmStrDup(reason);
+        }
+    }
+
+    cJSON* usage = cJSON_GetObjectItem(root, "usage");
+    long in = 0, outTok = 0, total = 0;
+    if (usage != NULL)
+    {
+        llmJsonLong(usage, "input_tokens", &in);
+        llmJsonLong(usage, "output_tokens", &outTok);
+        if (!llmJsonLong(usage, "total_tokens", &total))
+        {
+            total = in + outTok;
+        }
+    }
+
+    out->inputTokens  = in;
+    out->outputTokens = outTok;
+    out->totalTokens  = total;
+
+    cJSON* error = cJSON_GetObjectItem(root, "error");
+    if (error != NULL && !cJSON_IsNull(error))
+    {
+        const char* message = llmJsonStr(error, "message");
+        llmBufAppend(&ctx->errbuf,
+                     message ? message : "Responses API error");
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    cJSON_Delete(root);
+
+    return 0;
+}
+
+static void responsesStreamDecode(const char* payload, LlmStreamSink* sink)
+{
+    cJSON* root = cJSON_Parse(payload);
+    if (root == NULL)
+    {
+        return;
+    }
+
+    const char* type = llmJsonStr(root, "type");
+    if (type == NULL)
+    {
+        cJSON_Delete(root);
+        return;
+    }
+
+    size_t index = 0;
+    cJSON* oi = cJSON_GetObjectItem(root, "output_index");
+    if (oi != NULL && cJSON_IsNumber(oi))
+    {
+        index = (size_t)oi->valuedouble;
+    }
+
+    if (strcmp(type, "response.output_item.added") == 0)
+    {
+        cJSON* item = cJSON_GetObjectItem(root, "item");
+        const char* itype = item ? llmJsonStr(item, "type") : NULL;
+        if (itype != NULL && strcmp(itype, "function_call") == 0)
+        {
+            llmEmit(sink, LLMAPI_STREAM_TOOL_CALL, NULL,
+                    llmJsonStr(item, "call_id"), llmJsonStr(item, "name"),
+                    index);
+        }
+    }
+    else if (strcmp(type, "response.output_text.delta") == 0)
+    {
+        llmEmit(sink, LLMAPI_STREAM_TEXT, llmJsonStr(root, "delta"),
+                NULL, NULL, index);
+    }
+    else if (strcmp(type, "response.function_call_arguments.delta") == 0)
+    {
+        llmEmit(sink, LLMAPI_STREAM_TOOL_CALL, llmJsonStr(root, "delta"),
+                NULL, NULL, index);
+    }
+    else if (strcmp(type, "response.reasoning_summary_text.delta") == 0 ||
+             strcmp(type, "response.reasoning_text.delta") == 0)
+    {
+        llmEmit(sink, LLMAPI_STREAM_THINKING, llmJsonStr(root, "delta"),
+                NULL, NULL, index);
+    }
+    else if (strcmp(type, "response.completed") == 0 ||
+             strcmp(type, "response.incomplete") == 0 ||
+             strcmp(type, "response.failed") == 0)
+    {
+        cJSON* response = cJSON_GetObjectItem(root, "response");
+        cJSON* usage = response ? cJSON_GetObjectItem(response, "usage") : NULL;
+        if (usage != NULL)
+        {
+            long in = 0, outTok = 0;
+            if (llmJsonLong(usage, "input_tokens", &in))
+            {
+                sink->inputTokens = in;
+            }
+            if (llmJsonLong(usage, "output_tokens", &outTok))
+            {
+                sink->outputTokens = outTok;
+            }
+        }
+
+        sink->done = 1;
+        llmEmit(sink, LLMAPI_STREAM_DONE, NULL, NULL, NULL, 0);
+    }
+    else if (strcmp(type, "error") == 0)
+    {
+        sink->done = 1;
+        llmEmit(sink, LLMAPI_STREAM_DONE, NULL, NULL, NULL, 0);
+    }
+
+    cJSON_Delete(root);
+}
+
+// ==================== Provider table ====================
+
+static const char* const gAnthropicStaticHeaders[] = {
+    "anthropic-version: " LLMAPI_ANTHROPIC_VERSION,
+    NULL
+};
+
+static const LlmProvider gOpenAIProvider = {
+    "/chat/completions",
+    "Authorization",
+    "Bearer ",
+    NULL,
+    openaiEncode,
+    openaiDecode,
+    openaiStreamDecode
+};
+
+static const LlmProvider gAnthropicProvider = {
+    "/messages",
+    "x-api-key",
+    "",
+    gAnthropicStaticHeaders,
+    anthropicEncode,
+    anthropicDecode,
+    anthropicStreamDecode
+};
+
+static const LlmProvider gResponsesProvider = {
+    "/responses",
+    "Authorization",
+    "Bearer ",
+    NULL,
+    responsesEncode,
+    responsesDecode,
+    responsesStreamDecode
+};
+
+static const LlmProvider* llmGetProvider(const LlmmapiCtx* ctx)
+{
+    switch (ctx->api)
+    {
+        case LLMMAPI_API_ANTHROPIC:
+            return &gAnthropicProvider;
+        case LLMMAPI_API_OPENAI_RESPONSES:
+            return &gResponsesProvider;
+        default:
+            return &gOpenAIProvider;
+    }
+}
+
+// ==================== Internal: URL / headers ====================
+
+static int llmJoinUrl(LlmBuf* out, const char* baseUrl, const char* path)
 {
     if (baseUrl == NULL || path == NULL)
     {
@@ -828,58 +2606,85 @@ static int llmapiJoinUrl(LlmBuf* out, const char* baseUrl, const char* path)
     return llmBufAppend(out, path);
 }
 
-// Fill urlBuf, authBuf and the NULL-terminated header array.  `headers`
-// must have room for at least 4 entries.  Returns 0 on success, -1 on
-// failure (with a message appended to ctx->errbuf).
-static int llmapiBuildRequest(LlmmapiCtx* ctx,
-                               const char* baseUrl,
-                               const char* apiKey,
-                               int stream,
-                               LlmBuf* urlBuf,
-                               LlmBuf* authBuf,
-                               const char** headers)
+static int llmBuildHeaders(LlmmapiCtx* ctx, const LlmProvider* provider,
+                           const char* apiKey, int stream, LlmBuf* authBuf,
+                           const char** headers, size_t headersCap)
 {
-    if (llmapiHasCrlf(baseUrl))
-    {
-        llmBufAppend(&ctx->errbuf, "baseUrl contains invalid characters");
-        return -1;
-    }
-
-    if (llmapiHasCrlf(apiKey))
+    if (llmHasCrlf(apiKey))
     {
         llmBufAppend(&ctx->errbuf, "apiKey contains invalid characters");
         return -1;
     }
 
-    if (llmapiJoinUrl(urlBuf, baseUrl, "chat/completions") != 0)
-    {
-        llmBufAppend(&ctx->errbuf, "Failed to build request URL");
-        return -1;
-    }
-
-    llmBufAppend(authBuf, "Authorization: Bearer ");
-    llmBufAppend(authBuf, apiKey);
-
     size_t n = 0;
+
+    if (n + 1 >= headersCap) return -1;
     headers[n++] = "Content-Type: application/json";
+
     if (stream)
     {
+        if (n + 1 >= headersCap) return -1;
         headers[n++] = "Accept: text/event-stream";
     }
-    headers[n++] = authBuf->data;
-    headers[n]   = NULL;
+
+    if (apiKey != NULL)
+    {
+        if (llmBufAppend(authBuf, provider->authHeader) != 0 ||
+            llmBufAppend(authBuf, ": ") != 0 ||
+            llmBufAppend(authBuf, provider->authPrefix) != 0 ||
+            llmBufAppend(authBuf, apiKey) != 0)
+        {
+            llmBufAppend(&ctx->errbuf, "Out of memory");
+            return -1;
+        }
+
+        if (n + 1 >= headersCap) return -1;
+        headers[n++] = authBuf->data;
+    }
+
+    if (provider->staticHeaders != NULL)
+    {
+        for (size_t i = 0; provider->staticHeaders[i] != NULL; i++)
+        {
+            if (n + 1 >= headersCap) return -1;
+            headers[n++] = provider->staticHeaders[i];
+        }
+    }
+
+    headers[n] = NULL;
 
     return 0;
 }
 
-// ==================== Sync Chat ====================
+// ==================== Internal: chunk collector ====================
 
-char* llmapiChatComplete(LlmmapiCtx* ctx,
-                          const char* baseUrl,
-                          const char* apiKey,
-                          const LlmmapiReq* req)
+static int llmCollectChunk(const void* data, size_t len, void* userdata)
 {
-    if (ctx == NULL || baseUrl == NULL || apiKey == NULL || req == NULL)
+    LlmBuf* buf = (LlmBuf*)userdata;
+
+    if (llmBufGrow(buf, buf->len + len + 1) != 0)
+    {
+        return 0;
+    }
+
+    if (len > 0)
+    {
+        memcpy(buf->data + buf->len, data, len);
+        buf->len += len;
+    }
+    buf->data[buf->len] = '\0';
+
+    return 1;
+}
+
+// ==================== Sync completion ====================
+
+LlmmapiResp* llmapiChatComplete(LlmmapiCtx* ctx,
+                                const char* baseUrl,
+                                const char* apiKey,
+                                const LlmmapiReq* req)
+{
+    if (ctx == NULL || baseUrl == NULL || req == NULL)
     {
         return NULL;
     }
@@ -894,12 +2699,23 @@ char* llmapiChatComplete(LlmmapiCtx* ctx,
         return NULL;
     }
 
+    if (llmHasCrlf(baseUrl))
+    {
+        llmBufAppend(&ctx->errbuf, "baseUrl contains invalid characters");
+        return NULL;
+    }
+
+    const LlmProvider* provider = llmGetProvider(ctx);
+
     LlmBuf bodyBuf;
     llmBufInit(&bodyBuf);
 
-    if (llmapiBuildRequestBody(req, 0, &bodyBuf) != 0)
+    if (provider->encode(ctx, req, 0, &bodyBuf) != 0)
     {
-        llmBufAppend(&ctx->errbuf, "Failed to build request body");
+        if (ctx->errbuf.len == 0)
+        {
+            llmBufAppend(&ctx->errbuf, "Failed to build request body");
+        }
         llmBufFree(&bodyBuf);
         return NULL;
     }
@@ -909,9 +2725,16 @@ char* llmapiChatComplete(LlmmapiCtx* ctx,
     llmBufInit(&urlBuf);
     llmBufInit(&authBuf);
 
-    const char* headers[4];
-    if (llmapiBuildRequest(ctx, baseUrl, apiKey, 0,
-                           &urlBuf, &authBuf, headers) != 0)
+    if (llmJoinUrl(&urlBuf, baseUrl, provider->path) != 0)
+    {
+        llmBufAppend(&ctx->errbuf, "Failed to build request URL");
+        llmBufFree(&bodyBuf);
+        llmBufFree(&urlBuf);
+        return NULL;
+    }
+
+    const char* headers[8];
+    if (llmBuildHeaders(ctx, provider, apiKey, 0, &authBuf, headers, 8) != 0)
     {
         llmBufFree(&bodyBuf);
         llmBufFree(&urlBuf);
@@ -944,295 +2767,80 @@ char* llmapiChatComplete(LlmmapiCtx* ctx,
     if (rc != 0 || (result.error != NULL && result.error[0] != '\0'))
     {
         llmBufAppend(&ctx->errbuf,
-                     (result.error != NULL) ? result.error
-                                            : "transport error");
+                     (result.error != NULL) ? result.error : "transport error");
         llmBufFree(&respBuf);
         return NULL;
     }
 
     if (result.status < 200 || result.status >= 300)
     {
-        llmBufAppendFmt(&ctx->errbuf,
-                        "HTTP %ld: %s",
-                        result.status,
+        llmBufAppendFmt(&ctx->errbuf, "HTTP %ld: %s", result.status,
                         respBuf.data ? respBuf.data : "");
         llmBufFree(&respBuf);
         return NULL;
     }
 
-    return llmBufDetach(&respBuf);
-}
-
-// ==================== Raw Request ====================
-
-char* llmapiRequest(LlmmapiCtx* ctx,
-                    const char* baseUrl,
-                    const char* apiKey,
-                    const char* method,
-                    const char* path,
-                    const char* contentType,
-                    const void* body,
-                    size_t bodyLen)
-{
-    if (ctx == NULL || baseUrl == NULL || method == NULL || path == NULL)
+    LlmmapiResp* resp = (LlmmapiResp*)calloc(1, sizeof(LlmmapiResp));
+    if (resp == NULL)
     {
-        return NULL;
-    }
-
-    llmBufFree(&ctx->errbuf);
-    llmBufInit(&ctx->errbuf);
-
-    if (!ctx->hasTransport)
-    {
-        llmBufAppend(&ctx->errbuf,
-                     "no transport set (call llmapiSetTransport)");
-        return NULL;
-    }
-
-    if (method[0] == '\0' || llmapiHasCrlf(method))
-    {
-        llmBufAppend(&ctx->errbuf, "invalid method");
-        return NULL;
-    }
-
-    if (llmapiHasCrlf(baseUrl) || llmapiHasCrlf(path))
-    {
-        llmBufAppend(&ctx->errbuf, "baseUrl/path contains invalid characters");
-        return NULL;
-    }
-
-    if (llmapiHasCrlf(apiKey))
-    {
-        llmBufAppend(&ctx->errbuf, "apiKey contains invalid characters");
-        return NULL;
-    }
-
-    if (llmapiHasCrlf(contentType))
-    {
-        llmBufAppend(&ctx->errbuf, "contentType contains invalid characters");
-        return NULL;
-    }
-
-    if (body == NULL && bodyLen != 0)
-    {
-        llmBufAppend(&ctx->errbuf, "body is NULL but bodyLen is non-zero");
-        return NULL;
-    }
-
-    LlmBuf urlBuf;
-    LlmBuf authBuf;
-    LlmBuf ctBuf;
-    llmBufInit(&urlBuf);
-    llmBufInit(&authBuf);
-    llmBufInit(&ctBuf);
-
-    if (llmapiJoinUrl(&urlBuf, baseUrl, path) != 0)
-    {
-        llmBufAppend(&ctx->errbuf, "Failed to build request URL");
-        llmBufFree(&urlBuf);
-        return NULL;
-    }
-
-    const char* headers[3];
-    size_t nh = 0;
-
-    if (contentType != NULL)
-    {
-        if (llmBufAppend(&ctBuf, "Content-Type: ") != 0 ||
-            llmBufAppend(&ctBuf, contentType) != 0)
-        {
-            llmBufAppend(&ctx->errbuf, "Out of memory");
-            llmBufFree(&urlBuf);
-            llmBufFree(&ctBuf);
-            return NULL;
-        }
-        headers[nh++] = ctBuf.data;
-    }
-
-    if (apiKey != NULL)
-    {
-        if (llmBufAppend(&authBuf, "Authorization: Bearer ") != 0 ||
-            llmBufAppend(&authBuf, apiKey) != 0)
-        {
-            llmBufAppend(&ctx->errbuf, "Out of memory");
-            llmBufFree(&urlBuf);
-            llmBufFree(&ctBuf);
-            llmBufFree(&authBuf);
-            return NULL;
-        }
-        headers[nh++] = authBuf.data;
-    }
-
-    headers[nh] = NULL;
-
-    LlmmapiHttpRequest httpReq;
-    httpReq.method    = method;
-    httpReq.url       = urlBuf.data;
-    httpReq.headers   = headers;
-    httpReq.body      = body;
-    httpReq.bodyLen   = bodyLen;
-    httpReq.timeoutMs = 120000L;
-
-    LlmBuf respBuf;
-    llmBufInit(&respBuf);
-
-    LlmmapiHttpResult result;
-    result.status = 0;
-    result.error  = NULL;
-
-    int rc = ctx->transport.perform(ctx->transport.userdata, &httpReq,
-                                    llmCollectChunk, &respBuf, &result);
-
-    llmBufFree(&urlBuf);
-    llmBufFree(&ctBuf);
-    llmBufSecureFree(&authBuf);
-
-    if (rc != 0 || (result.error != NULL && result.error[0] != '\0'))
-    {
-        llmBufAppend(&ctx->errbuf,
-                     (result.error != NULL) ? result.error
-                                            : "transport error");
+        llmBufAppend(&ctx->errbuf, "Out of memory");
         llmBufFree(&respBuf);
         return NULL;
     }
 
-    if (result.status < 200 || result.status >= 300)
+    llmMessageInit(&resp->message);
+    resp->message.role = llmStrDup("assistant");
+
+    if (provider->decode(ctx, respBuf.data ? respBuf.data : "", resp) != 0)
     {
-        llmBufAppendFmt(&ctx->errbuf,
-                        "HTTP %ld: %s",
-                        result.status,
-                        respBuf.data ? respBuf.data : "");
+        if (ctx->errbuf.len == 0)
+        {
+            llmBufAppend(&ctx->errbuf, "Failed to parse response");
+        }
         llmBufFree(&respBuf);
+        llmapiRespFree(resp);
         return NULL;
     }
 
-    return llmBufDetach(&respBuf);
+    llmBufFree(&respBuf);
+
+    return resp;
 }
 
-// ==================== Internal: Streaming SSE Parser ====================
+// ==================== Streaming ====================
 
 struct LlmStreamCtx
 {
-    LlmBuf           lineBuf;
-    LlmBuf           rawBuf;
-    LlmmapiStreamCb  cb;
-    void*            userdata;
-    int              done;
-    int              usageTotal;
-    int              usagePrompt;
-    int              usageCompletion;
+    LlmBuf             lineBuf;
+    LlmBuf             rawBuf;
+    const LlmProvider* provider;
+    LlmStreamSink      sink;
 };
 
 static void llmProcessSseLine(struct LlmStreamCtx* sctx, const char* line,
-                               size_t len)
+                              size_t len)
 {
-    if (sctx->done || len == 0)
+    if (sctx->sink.done || len == 0)
     {
         return;
     }
 
-    if (len < 6 || strncmp(line, "data: ", 6) != 0)
+    // Accept both "data:" and "data: ".  Anthropic "event:" lines are ignored.
+    if (len < 5 || strncmp(line, "data:", 5) != 0)
     {
         return;
     }
 
-    const char* payload = line + 6;
-    size_t payloadLen = len - 6;
-
-    if (payloadLen == 6 && memcmp(payload, "[DONE]", 6) == 0)
+    const char* payload = line + 5;
+    if (*payload == ' ')
     {
-        sctx->done = 1;
-        sctx->cb(LLMAPI_STREAM_TEXT, NULL, 1, sctx->userdata);
-        return;
+        payload++;
     }
 
-    // `payload` is already NUL-terminated by the line buffer (see
-    // llmStreamWriteCallback), so it can be parsed in place.
-    cJSON* root = cJSON_Parse(payload);
-
-    if (root == NULL)
-    {
-        return;
-    }
-
-    cJSON* choices = cJSON_GetObjectItem(root, "choices");
-    if (choices != NULL && cJSON_IsArray(choices) &&
-        cJSON_GetArraySize(choices) > 0)
-    {
-        cJSON* choice = cJSON_GetArrayItem(choices, 0);
-        cJSON* delta  = cJSON_GetObjectItem(choice, "delta");
-
-        if (delta != NULL)
-        {
-            // standard text content
-            cJSON* content = cJSON_GetObjectItem(delta, "content");
-            if (content != NULL && cJSON_IsString(content) &&
-                content->valuestring[0] != '\0')
-            {
-                sctx->cb(LLMAPI_STREAM_TEXT,
-                         content->valuestring, 0, sctx->userdata);
-            }
-
-            // reasoning / thinking content
-            cJSON* reasoning = cJSON_GetObjectItem(delta, "reasoning_content");
-            if (reasoning != NULL && cJSON_IsString(reasoning) &&
-                reasoning->valuestring[0] != '\0')
-            {
-                sctx->cb(LLMAPI_STREAM_THINKING,
-                         reasoning->valuestring, 0, sctx->userdata);
-            }
-
-            // tool calls
-            cJSON* toolCalls = cJSON_GetObjectItem(delta, "tool_calls");
-            if (toolCalls != NULL && cJSON_IsArray(toolCalls) &&
-                cJSON_GetArraySize(toolCalls) > 0)
-            {
-                char* tcJson = cJSON_PrintUnformatted(toolCalls);
-                if (tcJson)
-                {
-                    sctx->cb(LLMAPI_STREAM_TOOL_CALL,
-                             tcJson, 0, sctx->userdata);
-                    free(tcJson);
-                }
-            }
-        }
-
-        cJSON* finish = cJSON_GetObjectItem(choice, "finish_reason");
-        if (finish != NULL && cJSON_IsString(finish) &&
-            finish->valuestring[0] != '\0')
-        {
-            sctx->done = 1;
-            sctx->cb(LLMAPI_STREAM_TEXT, NULL, 1, sctx->userdata);
-        }
-    }
-
-    // Some providers send token usage in the final SSE chunk.  Capture it so
-    // callers can report context usage after a streaming call completes.
-    cJSON* usage = cJSON_GetObjectItem(root, "usage");
-    if (usage != NULL && cJSON_IsObject(usage))
-    {
-        cJSON* item = cJSON_GetObjectItem(usage, "total_tokens");
-        if (item != NULL && cJSON_IsNumber(item))
-        {
-            sctx->usageTotal = (int)item->valuedouble;
-        }
-        item = cJSON_GetObjectItem(usage, "prompt_tokens");
-        if (item != NULL && cJSON_IsNumber(item))
-        {
-            sctx->usagePrompt = (int)item->valuedouble;
-        }
-        item = cJSON_GetObjectItem(usage, "completion_tokens");
-        if (item != NULL && cJSON_IsNumber(item))
-        {
-            sctx->usageCompletion = (int)item->valuedouble;
-        }
-    }
-
-    cJSON_Delete(root);
+    sctx->provider->streamDecode(payload, &sctx->sink);
 }
 
-static int llmStreamWriteCallback(const void* data,
-                                   size_t total,
+static int llmStreamWriteCallback(const void* data, size_t total,
                                    void* userdata)
 {
     struct LlmStreamCtx* sctx = (struct LlmStreamCtx*)userdata;
@@ -1253,9 +2861,7 @@ static int llmStreamWriteCallback(const void* data,
 
         if (c == '\n')
         {
-            llmProcessSseLine(sctx,
-                              sctx->lineBuf.data,
-                              sctx->lineBuf.len);
+            llmProcessSseLine(sctx, sctx->lineBuf.data, sctx->lineBuf.len);
 
             sctx->lineBuf.len = 0;
             if (sctx->lineBuf.data)
@@ -1287,17 +2893,14 @@ static int llmStreamWriteCallback(const void* data,
     return 1;
 }
 
-// ==================== Streaming Chat ====================
-
 int llmapiChatCompleteStream(LlmmapiCtx* ctx,
-                              const char* baseUrl,
-                              const char* apiKey,
-                              const LlmmapiReq* req,
-                              LlmmapiStreamCb cb,
-                              void* userdata)
+                             const char* baseUrl,
+                             const char* apiKey,
+                             const LlmmapiReq* req,
+                             LlmmapiStreamCb cb,
+                             void* userdata)
 {
-    if (ctx == NULL || baseUrl == NULL || apiKey == NULL ||
-        req == NULL || cb == NULL)
+    if (ctx == NULL || baseUrl == NULL || req == NULL || cb == NULL)
     {
         return -1;
     }
@@ -1312,12 +2915,23 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
         return -1;
     }
 
+    if (llmHasCrlf(baseUrl))
+    {
+        llmBufAppend(&ctx->errbuf, "baseUrl contains invalid characters");
+        return -1;
+    }
+
+    const LlmProvider* provider = llmGetProvider(ctx);
+
     LlmBuf bodyBuf;
     llmBufInit(&bodyBuf);
 
-    if (llmapiBuildRequestBody(req, 1, &bodyBuf) != 0)
+    if (provider->encode(ctx, req, 1, &bodyBuf) != 0)
     {
-        llmBufAppend(&ctx->errbuf, "Failed to build request body");
+        if (ctx->errbuf.len == 0)
+        {
+            llmBufAppend(&ctx->errbuf, "Failed to build request body");
+        }
         llmBufFree(&bodyBuf);
         return -1;
     }
@@ -1327,9 +2941,16 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
     llmBufInit(&urlBuf);
     llmBufInit(&authBuf);
 
-    const char* headers[4];
-    if (llmapiBuildRequest(ctx, baseUrl, apiKey, 1,
-                           &urlBuf, &authBuf, headers) != 0)
+    if (llmJoinUrl(&urlBuf, baseUrl, provider->path) != 0)
+    {
+        llmBufAppend(&ctx->errbuf, "Failed to build request URL");
+        llmBufFree(&bodyBuf);
+        llmBufFree(&urlBuf);
+        return -1;
+    }
+
+    const char* headers[8];
+    if (llmBuildHeaders(ctx, provider, apiKey, 1, &authBuf, headers, 8) != 0)
     {
         llmBufFree(&bodyBuf);
         llmBufFree(&urlBuf);
@@ -1340,12 +2961,12 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
     struct LlmStreamCtx sctx;
     llmBufInit(&sctx.lineBuf);
     llmBufInit(&sctx.rawBuf);
-    sctx.cb       = cb;
-    sctx.userdata = userdata;
-    sctx.done     = 0;
-    sctx.usageTotal      = 0;
-    sctx.usagePrompt     = 0;
-    sctx.usageCompletion = 0;
+    sctx.provider = provider;
+    sctx.sink.cb         = cb;
+    sctx.sink.userdata   = userdata;
+    sctx.sink.done       = 0;
+    sctx.sink.inputTokens  = 0;
+    sctx.sink.outputTokens = 0;
 
     LlmmapiHttpRequest httpReq;
     httpReq.method    = "POST";
@@ -1372,24 +2993,21 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
     }
     llmBufFree(&sctx.lineBuf);
 
-    ctx->lastTotalTokens      = sctx.usageTotal;
-    ctx->lastPromptTokens     = sctx.usagePrompt;
-    ctx->lastCompletionTokens = sctx.usageCompletion;
+    ctx->lastPromptTokens     = sctx.sink.inputTokens;
+    ctx->lastCompletionTokens = sctx.sink.outputTokens;
+    ctx->lastTotalTokens      = sctx.sink.inputTokens + sctx.sink.outputTokens;
 
     if (rc != 0 || (result.error != NULL && result.error[0] != '\0'))
     {
         llmBufAppend(&ctx->errbuf,
-                     (result.error != NULL) ? result.error
-                                            : "transport error");
+                     (result.error != NULL) ? result.error : "transport error");
         llmBufFree(&sctx.rawBuf);
         return -1;
     }
 
     if (result.status < 200 || result.status >= 300)
     {
-        llmBufAppendFmt(&ctx->errbuf,
-                        "HTTP %ld: %s",
-                        result.status,
+        llmBufAppendFmt(&ctx->errbuf, "HTTP %ld: %s", result.status,
                         sctx.rawBuf.data ? sctx.rawBuf.data : "");
         llmBufFree(&sctx.rawBuf);
         return -1;
@@ -1397,206 +3015,227 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
 
     llmBufFree(&sctx.rawBuf);
 
-    if (!sctx.done)
+    if (!sctx.sink.done)
     {
-        sctx.cb(LLMAPI_STREAM_TEXT, NULL, 1, sctx.userdata);
+        sctx.sink.done = 1;
+        llmEmit(&sctx.sink, LLMAPI_STREAM_DONE, NULL, NULL, NULL, 0);
     }
 
     return 0;
 }
 
-// Retrieve the token usage captured from the last streaming response.
-// Fields are set to 0 when no usage was reported by the provider.
 void llmapiStreamGetUsage(LlmmapiCtx* ctx,
-                          int* total,
-                          int* prompt,
-                          int* completion)
+                          long* total, long* input, long* output)
 {
     if (ctx == NULL)
     {
-        if (total)      *total = 0;
-        if (prompt)     *prompt = 0;
-        if (completion) *completion = 0;
+        if (total)  *total = 0;
+        if (input)  *input = 0;
+        if (output) *output = 0;
         return;
     }
-    if (total)      *total      = ctx->lastTotalTokens;
-    if (prompt)     *prompt     = ctx->lastPromptTokens;
-    if (completion) *completion = ctx->lastCompletionTokens;
+
+    if (total)  *total  = ctx->lastTotalTokens;
+    if (input)  *input  = ctx->lastPromptTokens;
+    if (output) *output = ctx->lastCompletionTokens;
 }
 
-// ==================== Response Helpers ====================
+// ==================== Response accessors ====================
 
-char* llmapiRespGetContent(const char* json, size_t idx)
+const LlmmapiMessage* llmapiRespGetMessage(const LlmmapiResp* resp)
 {
-    if (json == NULL)
+    return resp ? &resp->message : NULL;
+}
+
+char* llmapiRespGetText(const LlmmapiResp* resp)
+{
+    return resp ? llmConcatParts(&resp->message, LLMMAPI_PART_TEXT) : NULL;
+}
+
+char* llmapiRespGetThinking(const LlmmapiResp* resp)
+{
+    return resp ? llmConcatParts(&resp->message, LLMMAPI_PART_THINKING) : NULL;
+}
+
+const char* llmapiRespGetFinishReason(const LlmmapiResp* resp)
+{
+    return resp ? resp->finishReason : NULL;
+}
+
+void llmapiRespGetUsage(const LlmmapiResp* resp,
+                        long* input, long* output, long* total)
+{
+    if (resp == NULL)
+    {
+        if (input)  *input = 0;
+        if (output) *output = 0;
+        if (total)  *total = 0;
+        return;
+    }
+
+    if (input)  *input  = resp->inputTokens;
+    if (output) *output = resp->outputTokens;
+    if (total)  *total  = resp->totalTokens;
+}
+
+const char* llmapiRespGetRawJson(const LlmmapiResp* resp)
+{
+    return resp ? resp->rawJson : NULL;
+}
+
+void llmapiRespFree(LlmmapiResp* resp)
+{
+    if (resp == NULL)
+    {
+        return;
+    }
+
+    llmMessageFree(&resp->message);
+    free(resp->finishReason);
+    free(resp->rawJson);
+    free(resp);
+}
+
+// ==================== Raw request ====================
+
+char* llmapiRequest(LlmmapiCtx* ctx,
+                    const char* baseUrl,
+                    const char* apiKey,
+                    const char* method,
+                    const char* path,
+                    const char* contentType,
+                    const void* body,
+                    size_t bodyLen)
+{
+    if (ctx == NULL || baseUrl == NULL || method == NULL || path == NULL)
     {
         return NULL;
     }
 
-    cJSON* root = cJSON_Parse(json);
-    if (root == NULL)
+    llmBufFree(&ctx->errbuf);
+    llmBufInit(&ctx->errbuf);
+
+    if (!ctx->hasTransport)
     {
+        llmBufAppend(&ctx->errbuf,
+                     "no transport set (call llmapiSetTransport)");
         return NULL;
     }
 
-    char* result = NULL;
-
-    cJSON* choices = cJSON_GetObjectItem(root, "choices");
-    if (choices != NULL && cJSON_IsArray(choices) &&
-        (int)idx < cJSON_GetArraySize(choices))
+    if (method[0] == '\0' || llmHasCrlf(method))
     {
-        cJSON* choice  = cJSON_GetArrayItem(choices, idx);
-        cJSON* message = cJSON_GetObjectItem(choice, "message");
-        if (message != NULL)
-        {
-            cJSON* content = cJSON_GetObjectItem(message, "content");
-            if (content != NULL && cJSON_IsString(content))
-            {
-                result = strdup(content->valuestring);
-            }
-        }
-    }
-
-    cJSON_Delete(root);
-
-    return result;
-}
-
-char* llmapiRespGetReasoningContent(const char* json, size_t idx)
-{
-    if (json == NULL)
-    {
+        llmBufAppend(&ctx->errbuf, "invalid method");
         return NULL;
     }
 
-    cJSON* root = cJSON_Parse(json);
-    if (root == NULL)
+    if (llmHasCrlf(baseUrl) || llmHasCrlf(path) ||
+        llmHasCrlf(apiKey) || llmHasCrlf(contentType))
     {
+        llmBufAppend(&ctx->errbuf, "invalid characters in request fields");
         return NULL;
     }
 
-    char* result = NULL;
-
-    cJSON* choices = cJSON_GetObjectItem(root, "choices");
-    if (choices != NULL && cJSON_IsArray(choices) &&
-        (int)idx < cJSON_GetArraySize(choices))
+    if (body == NULL && bodyLen != 0)
     {
-        cJSON* choice  = cJSON_GetArrayItem(choices, idx);
-        cJSON* message = cJSON_GetObjectItem(choice, "message");
-        if (message != NULL)
-        {
-            cJSON* reasoning = cJSON_GetObjectItem(message, "reasoning_content");
-            if (reasoning != NULL && cJSON_IsString(reasoning))
-            {
-                result = strdup(reasoning->valuestring);
-            }
-        }
-    }
-
-    cJSON_Delete(root);
-
-    return result;
-}
-
-char* llmapiRespGetToolCallsJson(const char* json, size_t idx)
-{
-    if (json == NULL)
-    {
+        llmBufAppend(&ctx->errbuf, "body is NULL but bodyLen is non-zero");
         return NULL;
     }
 
-    cJSON* root = cJSON_Parse(json);
-    if (root == NULL)
+    const LlmProvider* provider = llmGetProvider(ctx);
+
+    LlmBuf urlBuf;
+    LlmBuf authBuf;
+    LlmBuf ctBuf;
+    llmBufInit(&urlBuf);
+    llmBufInit(&authBuf);
+    llmBufInit(&ctBuf);
+
+    if (llmJoinUrl(&urlBuf, baseUrl, path) != 0)
     {
+        llmBufAppend(&ctx->errbuf, "Failed to build request URL");
+        llmBufFree(&urlBuf);
         return NULL;
     }
 
-    char* result = NULL;
+    const char* headers[8];
+    size_t nh = 0;
 
-    cJSON* choices = cJSON_GetObjectItem(root, "choices");
-    if (choices != NULL && cJSON_IsArray(choices) &&
-        (int)idx < cJSON_GetArraySize(choices))
+    if (contentType != NULL)
     {
-        cJSON* choice  = cJSON_GetArrayItem(choices, idx);
-        cJSON* message = cJSON_GetObjectItem(choice, "message");
-        if (message != NULL)
+        if (llmBufAppend(&ctBuf, "Content-Type: ") != 0 ||
+            llmBufAppend(&ctBuf, contentType) != 0)
         {
-            cJSON* toolCalls = cJSON_GetObjectItem(message, "tool_calls");
-            if (toolCalls != NULL && cJSON_IsArray(toolCalls) &&
-                cJSON_GetArraySize(toolCalls) > 0)
-            {
-                result = cJSON_PrintUnformatted(toolCalls);
-            }
+            llmBufAppend(&ctx->errbuf, "Out of memory");
+            llmBufFree(&urlBuf);
+            llmBufFree(&ctBuf);
+            return NULL;
+        }
+        headers[nh++] = ctBuf.data;
+    }
+
+    if (apiKey != NULL)
+    {
+        if (llmBufAppend(&authBuf, provider->authHeader) != 0 ||
+            llmBufAppend(&authBuf, ": ") != 0 ||
+            llmBufAppend(&authBuf, provider->authPrefix) != 0 ||
+            llmBufAppend(&authBuf, apiKey) != 0)
+        {
+            llmBufAppend(&ctx->errbuf, "Out of memory");
+            llmBufFree(&urlBuf);
+            llmBufFree(&ctBuf);
+            llmBufFree(&authBuf);
+            return NULL;
+        }
+        headers[nh++] = authBuf.data;
+    }
+
+    if (provider->staticHeaders != NULL)
+    {
+        for (size_t i = 0; provider->staticHeaders[i] != NULL && nh + 1 < 8; i++)
+        {
+            headers[nh++] = provider->staticHeaders[i];
         }
     }
 
-    cJSON_Delete(root);
+    headers[nh] = NULL;
 
-    return result;
-}
+    LlmmapiHttpRequest httpReq;
+    httpReq.method    = method;
+    httpReq.url       = urlBuf.data;
+    httpReq.headers   = headers;
+    httpReq.body      = body;
+    httpReq.bodyLen   = bodyLen;
+    httpReq.timeoutMs = 120000L;
 
-int llmapiRespGetTotalTokens(const char* json)
-{
-    if (json == NULL) return -1;
+    LlmBuf respBuf;
+    llmBufInit(&respBuf);
 
-    cJSON* root = cJSON_Parse(json);
-    if (root == NULL) return -1;
+    LlmmapiHttpResult result;
+    result.status = 0;
+    result.error  = NULL;
 
-    int val = -1;
-    cJSON* usage = cJSON_GetObjectItem(root, "usage");
-    if (usage != NULL)
+    int rc = ctx->transport.perform(ctx->transport.userdata, &httpReq,
+                                    llmCollectChunk, &respBuf, &result);
+
+    llmBufFree(&urlBuf);
+    llmBufFree(&ctBuf);
+    llmBufSecureFree(&authBuf);
+
+    if (rc != 0 || (result.error != NULL && result.error[0] != '\0'))
     {
-        cJSON* tokens = cJSON_GetObjectItem(usage, "total_tokens");
-        if (tokens != NULL && cJSON_IsNumber(tokens))
-        {
-            val = tokens->valueint;
-        }
+        llmBufAppend(&ctx->errbuf,
+                     (result.error != NULL) ? result.error : "transport error");
+        llmBufFree(&respBuf);
+        return NULL;
     }
 
-    cJSON_Delete(root);
-    return val;
-}
-
-int llmapiRespGetPromptTokens(const char* json)
-{
-    if (json == NULL) return -1;
-
-    cJSON* root = cJSON_Parse(json);
-    if (root == NULL) return -1;
-
-    int val = -1;
-    cJSON* usage = cJSON_GetObjectItem(root, "usage");
-    if (usage != NULL)
+    if (result.status < 200 || result.status >= 300)
     {
-        cJSON* tokens = cJSON_GetObjectItem(usage, "prompt_tokens");
-        if (tokens != NULL && cJSON_IsNumber(tokens))
-        {
-            val = tokens->valueint;
-        }
+        llmBufAppendFmt(&ctx->errbuf, "HTTP %ld: %s", result.status,
+                        respBuf.data ? respBuf.data : "");
+        llmBufFree(&respBuf);
+        return NULL;
     }
 
-    cJSON_Delete(root);
-    return val;
-}
-
-int llmapiRespGetCompletionTokens(const char* json)
-{
-    if (json == NULL) return -1;
-
-    cJSON* root = cJSON_Parse(json);
-    if (root == NULL) return -1;
-
-    int val = -1;
-    cJSON* usage = cJSON_GetObjectItem(root, "usage");
-    if (usage != NULL)
-    {
-        cJSON* tokens = cJSON_GetObjectItem(usage, "completion_tokens");
-        if (tokens != NULL && cJSON_IsNumber(tokens))
-        {
-            val = tokens->valueint;
-        }
-    }
-
-    cJSON_Delete(root);
-    return val;
+    return llmBufDetach(&respBuf);
 }

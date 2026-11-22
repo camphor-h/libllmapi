@@ -1,9 +1,8 @@
 // llmapi.h -- Public API for libllmapi
 //
-// A C99 library for calling LLM APIs (OpenAI-compatible).
-//
-// The HTTP(S) transport is not built in: you inject one via llmapiSetTransport().
-// JSON is handled with cjson.
+// A C99 library for calling LLM APIs.  The HTTP(S) transport is injected by
+// the caller (see llmapiSetTransport), and the wire protocol is selected with
+// llmapiSetApi() (OpenAI / Anthropic).  JSON is handled with cjson.
 //
 // Copyright (c) 2025, libllmapi contributors
 // All rights reserved.
@@ -45,9 +44,6 @@ extern "C"
 // It holds shared mutable state (the error buffer and the last token-usage
 // counters) that is written without locking.  Serialise calls per context, or
 // give each thread its own context.
-//
-// llmapiInit() / llmapiCleanup() additionally must not race with each other;
-// do them once, before spawning workers.
 
 typedef struct LlmmapiCtx LlmmapiCtx;
 
@@ -73,12 +69,9 @@ typedef int (*LlmmapiWriteFn)(const void* data, size_t len, void* userdata);
 typedef struct
 {
     const char*        method;    // always "POST"
-    const char*        url;       // baseUrl + "/chat/completions"
-    const char* const* headers;   // NULL-terminated list:
-                                  //   "Content-Type: application/json"
-                                  //   "Accept: text/event-stream" (streaming only)
-                                  //   "Authorization: Bearer <apiKey>"
-    const void*        body;      // serialized JSON request body
+    const char*        url;       // baseUrl + provider path
+    const char* const* headers;   // NULL-terminated list
+    const void*        body;      // serialized request body
     size_t             bodyLen;
     long               timeoutMs; // suggested timeout; transport may ignore
 } LlmmapiHttpRequest;
@@ -108,17 +101,69 @@ typedef struct LlmmapiTransport
     void* userdata;
 } LlmmapiTransport;
 
-// Inject the transport used by this context.  The struct is copied, so
-// `transport` only needs to remain valid for the duration of this call
-// (its userdata pointer is not owned by the library).  Pass NULL to detach.
-// Without a transport, every chat call fails with an error.
+// Inject the transport used by this context.  The struct is copied.
+// Pass NULL to detach.  Without a transport, every call fails.
 void llmapiSetTransport(LlmmapiCtx* ctx, const LlmmapiTransport* transport);
 
-// ==================== Role Macros ====================
+// ==================== Provider (wire protocol) ====================
+
+typedef enum
+{
+    LLMMAPI_API_OPENAI = 0,        // POST /chat/completions
+    LLMMAPI_API_ANTHROPIC,         // POST /messages
+    LLMMAPI_API_OPENAI_RESPONSES,  // POST /responses
+} LlmmapiApi;
+
+// Select the wire protocol.  Default is LLMMAPI_API_OPENAI.
+void llmapiSetApi(LlmmapiCtx* ctx, LlmmapiApi api);
+
+// ==================== Roles ====================
 
 #define LLMAPI_ROLE_SYSTEM    "system"
 #define LLMAPI_ROLE_USER      "user"
 #define LLMAPI_ROLE_ASSISTANT "assistant"
+#define LLMAPI_ROLE_TOOL      "tool"
+
+// ==================== Neutral content model ====================
+//
+// A message is a role plus a list of typed parts.  Providers translate this
+// model to/from their own wire format, so the same request works across APIs.
+
+typedef enum
+{
+    LLMMAPI_PART_TEXT,        // text: plain text
+    LLMMAPI_PART_IMAGE,       // url: http(s) URL or data: URL
+    LLMMAPI_PART_FILE,        // filename + mimeType + (url or fileId)
+    LLMMAPI_PART_THINKING,    // text: reasoning (assistant output only)
+    LLMMAPI_PART_TOOL_CALL,   // toolCallId + toolName + text(arguments JSON)
+    LLMMAPI_PART_TOOL_RESULT, // toolCallId + text(result content)
+} LlmmapiPartType;
+
+typedef struct
+{
+    LlmmapiPartType type;
+
+    char* text;       // TEXT / THINKING / TOOL_CALL arguments / TOOL_RESULT
+    char* url;        // IMAGE / FILE (http(s) or data: URL)
+    char* mimeType;   // IMAGE / FILE
+    char* filename;   // FILE
+    char* fileId;     // FILE (provider-side file reference, if any)
+    char* toolCallId; // TOOL_CALL / TOOL_RESULT
+    char* toolName;   // TOOL_CALL
+} LlmmapiPart;
+
+typedef struct
+{
+    char*         role;
+    LlmmapiPart*  parts;
+    size_t        partCount;
+} LlmmapiMessage;
+
+// Number of parts in a message.
+size_t llmapiMessageGetPartCount(const LlmmapiMessage* msg);
+
+// Borrowed pointer to a part, or NULL when idx is out of range.
+const LlmmapiPart* llmapiMessageGetPart(const LlmmapiMessage* msg, size_t idx);
 
 // ==================== Request ====================
 
@@ -127,43 +172,108 @@ typedef struct LlmmapiReq LlmmapiReq;
 LlmmapiReq* llmapiReqNew(const char* model);
 void        llmapiReqFree(LlmmapiReq* req);
 
-// Add a message to the request.  role is "system", "user", "assistant", or "tool".
-// The role and content strings are copied internally.
-void llmapiReqAddMsg(LlmmapiReq* req, const char* role, const char* content);
+// Append a new message and return a handle to it (owned by req).
+LlmmapiMessage* llmapiReqAddMessage(LlmmapiReq* req, const char* role);
 
-// Add a message whose `content` is raw JSON (content parts) instead of a plain
-// string.  contentJson must be a valid JSON array, e.g.:
-//   [{"type":"text","text":"describe this"},
-//    {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]
-// The library does not read files or perform base64 encoding; build the array
-// yourself.  Invalid JSON makes the chat call fail.
-void llmapiReqAddMsgJson(LlmmapiReq* req, const char* role, const char* contentJson);
+// Convenience: add a message with a single TEXT part.
+void llmapiReqAddMsg(LlmmapiReq* req, const char* role, const char* text);
 
-// Add an assistant message with tool_calls (content is null).
-// toolCallsJson must be a valid JSON array of tool call objects.
-void llmapiReqAddAssistantToolCalls(LlmmapiReq* req, const char* toolCallsJson);
+// Add parts to a message.
+void llmapiMsgAddText(LlmmapiMessage* msg, const char* text);
 
-// Add a tool result message (role="tool") with a tool_call_id.
-void llmapiReqAddToolResult(LlmmapiReq* req, const char* toolCallId, const char* name, const char* content);
+// url may be an http(s) URL or a data: URL (caller does any base64 encoding).
+void llmapiMsgAddImage(LlmmapiMessage* msg, const char* url);
+
+// dataUrlOrFileId: if it starts with "data:" it is treated as an inline data
+// URL, otherwise as a provider-side file id.
+void llmapiMsgAddFile(LlmmapiMessage* msg, const char* filename,
+                      const char* mimeType, const char* dataUrlOrFileId);
+
+// argsJson is a JSON object string with the tool arguments.
+void llmapiMsgAddToolCall(LlmmapiMessage* msg, const char* toolCallId,
+                          const char* toolName, const char* argsJson);
+
+// Use on a message whose role is LLMAPI_ROLE_TOOL.
+void llmapiMsgAddToolResult(LlmmapiMessage* msg, const char* toolCallId,
+                            const char* content);
+
+// Register a tool. parametersJson is a JSON Schema object string.
+void llmapiReqAddTool(LlmmapiReq* req, const char* name,
+                      const char* description, const char* parametersJson);
 
 void llmapiReqSetMaxTokens(LlmmapiReq* req, size_t maxTokens);
 void llmapiReqSetTemperature(LlmmapiReq* req, double temp);
+void llmapiReqSetTopP(LlmmapiReq* req, double topP);
 
-// Generic setter for any Chat Completions parameter.
-// jsonValue must be a valid JSON literal:
-//   llmapiReqSet(req, "top_p", "0.9")
-//   llmapiReqSet(req, "stop",   "[\"END\"]")
-// If jsonValue is not parseable as JSON, it is treated as a raw string.
-void llmapiReqSet(LlmmapiReq* req, const char* key, const char* jsonValue);
+// jsonArray is a JSON array string, e.g. "[\"END\"]".
+void llmapiReqSetStop(LlmmapiReq* req, const char* jsonArray);
 
-// ==================== Sync Chat ====================
+// Escape hatch: set a provider-native top-level parameter.
+void llmapiReqSetExtra(LlmmapiReq* req, const char* key, const char* jsonValue);
 
-// Returns a malloc'd JSON string (full API response) on success, or NULL.
-// Caller must free the returned string.
-char* llmapiChatComplete(LlmmapiCtx* ctx,
-                          const char* baseUrl,
-                          const char* apiKey,
-                          const LlmmapiReq* req);
+// ==================== Response ====================
+
+typedef struct LlmmapiResp LlmmapiResp;
+
+// Borrowed assistant message (role="assistant", parts filled in).
+const LlmmapiMessage* llmapiRespGetMessage(const LlmmapiResp* resp);
+
+// Concatenated TEXT parts.  Returns a malloc'd string, or NULL if none.
+char* llmapiRespGetText(const LlmmapiResp* resp);
+
+// Concatenated THINKING parts.  Returns a malloc'd string, or NULL if none.
+char* llmapiRespGetThinking(const LlmmapiResp* resp);
+
+// Borrowed finish/stop reason string, or NULL.
+const char* llmapiRespGetFinishReason(const LlmmapiResp* resp);
+
+// Token usage.  Any output pointer may be NULL.
+void llmapiRespGetUsage(const LlmmapiResp* resp,
+                        long* input, long* output, long* total);
+
+// Borrowed raw provider response body, or NULL.
+const char* llmapiRespGetRawJson(const LlmmapiResp* resp);
+
+void llmapiRespFree(LlmmapiResp* resp);
+
+// ==================== Completion ====================
+
+LlmmapiResp* llmapiChatComplete(LlmmapiCtx* ctx,
+                                const char* baseUrl,
+                                const char* apiKey,
+                                const LlmmapiReq* req);
+
+// Neutral streaming events.
+typedef enum
+{
+    LLMAPI_STREAM_TEXT,       // text delta
+    LLMAPI_STREAM_THINKING,   // reasoning delta
+    LLMAPI_STREAM_TOOL_CALL,  // tool name/id (when known) and arguments delta
+    LLMAPI_STREAM_DONE,       // final event
+} LlmmapiStreamType;
+
+typedef struct
+{
+    LlmmapiStreamType type;
+    const char*       text;       // TEXT / THINKING / partial tool arguments
+    const char*       toolCallId; // TOOL_CALL (may be NULL on later deltas)
+    const char*       toolName;   // TOOL_CALL (may be NULL on later deltas)
+    size_t            toolIndex;  // TOOL_CALL index
+} LlmmapiStreamEvent;
+
+typedef void (*LlmmapiStreamCb)(const LlmmapiStreamEvent* ev, void* userdata);
+
+// Returns 0 on success, -1 on failure.
+int llmapiChatCompleteStream(LlmmapiCtx* ctx,
+                             const char* baseUrl,
+                             const char* apiKey,
+                             const LlmmapiReq* req,
+                             LlmmapiStreamCb cb,
+                             void* userdata);
+
+// Token usage captured from the last streaming call.
+void llmapiStreamGetUsage(LlmmapiCtx* ctx,
+                          long* total, long* input, long* output);
 
 // ==================== Raw Request ====================
 
@@ -173,14 +283,9 @@ char* llmapiChatComplete(LlmmapiCtx* ctx,
 // - method:       "GET", "POST", "PUT", "DELETE", ...
 // - path:         appended to baseUrl, e.g. "files" or "/files"
 // - contentType:  value for Content-Type, or NULL to omit it
-//                 e.g. "application/json"
-//                      "multipart/form-data; boundary=----xyz"
-// - apiKey:       if non-NULL, adds "Authorization: Bearer <apiKey>"
+// - apiKey:       if non-NULL, adds an Authorization header using the selected
+//                 provider's scheme
 // - body/bodyLen: raw request bytes (NULL/0 for GET)
-//
-// Only Content-Type and Authorization are set.  The whole response body is
-// buffered, so this is not suitable for streaming.  Use llmapiStrError() for
-// the reason on failure.
 char* llmapiRequest(LlmmapiCtx* ctx,
                     const char* baseUrl,
                     const char* apiKey,
@@ -189,61 +294,6 @@ char* llmapiRequest(LlmmapiCtx* ctx,
                     const char* contentType,
                     const void* body,
                     size_t bodyLen);
-
-// ==================== Streaming ====================
-
-// Content type for streaming callbacks.
-typedef enum
-{
-    LLMAPI_STREAM_TEXT,       // standard text delta
-    LLMAPI_STREAM_THINKING,   // reasoning / thinking content
-    LLMAPI_STREAM_TOOL_CALL,  // tool call delta (JSON string)
-} LlmmapiStreamType;
-
-// Callback invoked for each streaming chunk.
-// @param type     Content type (text, thinking, tool call).
-// @param content  Text / reasoning / tool-call-JSON delta (may be NULL).
-//                 Pointer is valid only during the callback;
-//                 strdup() for persistence.
-// @param done     1 if final chunk, 0 otherwise.
-// @param userdata User-supplied pointer.
-typedef void (*LlmmapiStreamCb)(LlmmapiStreamType type,
-                                 const char* content,
-                                 int done,
-                                 void* userdata);
-
-// Returns 0 on success, -1 on failure.
-int llmapiChatCompleteStream(LlmmapiCtx* ctx,
-                              const char* baseUrl,
-                              const char* apiKey,
-                              const LlmmapiReq* req,
-                              LlmmapiStreamCb cb,
-                              void* userdata);
-
-// Retrieve the token usage captured from the last streaming response.
-// Fields are set to 0 when the provider reported no usage.
-void llmapiStreamGetUsage(LlmmapiCtx* ctx,
-                          int* total,
-                          int* prompt,
-                          int* completion);
-
-// ==================== Response Helpers ====================
-
-// Extract text content from choices[idx].message.content.
-// Returns malloc'd string (caller must free) or NULL.
-char* llmapiRespGetContent(const char* json, size_t idx);
-
-// Extract reasoning/thinking content from choices[idx].message.reasoning_content.
-// Returns malloc'd string (caller must free) or NULL.
-char* llmapiRespGetReasoningContent(const char* json, size_t idx);
-
-// Extract serialised tool_calls JSON from choices[idx].message.tool_calls.
-// Returns malloc'd JSON string or NULL.
-char* llmapiRespGetToolCallsJson(const char* json, size_t idx);
-
-int   llmapiRespGetTotalTokens(const char* json);
-int   llmapiRespGetPromptTokens(const char* json);
-int   llmapiRespGetCompletionTokens(const char* json);
 
 #ifdef __cplusplus
 }

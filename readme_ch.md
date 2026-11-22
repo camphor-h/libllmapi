@@ -1,10 +1,12 @@
 # libllmapi
 
-使用 **cjson** 调用 OpenAI 兼容 LLM API 的 C99 库。
+使用**与 provider 无关的消息模型**调用 LLM API 的 C99 库。
 
-HTTP(S) 传输层**不内置**，由调用方注入，因此不绑定任何 HTTP/TLS 实现（libcurl、WinHTTP、esp_http_client、mock 等）。
-
-支持普通文本、推理思考（thinking）、工具调用（tool calls）的同步/流式输出。
+- 协议：**OpenAI Chat Completions** (`/chat/completions`)、
+  **OpenAI Responses** (`/responses`) 与 **Anthropic** (`/messages`)
+- HTTP(S) 传输层**不内置**，由调用方注入（libcurl、WinHTTP、esp_http_client、mock 等）
+- JSON 使用 **cjson**
+- 支持同步/流式、文本/思考/工具调用、图片与文件
 
 ## 依赖
 
@@ -17,9 +19,9 @@ cc -std=c99 -c llmapi.c -o llmapi.o
 cc -std=c99 your_program.c llmapi.o -lcjson -o your_program
 ```
 
-## 使用示例
+## 使用
 
-### 注入传输层（必需）
+### 1. 注入传输层（必需）
 
 库本身不做任何网络 I/O，发请求前必须先注入一个 transport：
 
@@ -30,55 +32,60 @@ static int myPerform(void* ud, const LlmmapiHttpRequest* req,
 {
     // 在这里驱动 libcurl / WinHTTP / esp_http_client 等。
     // 每收到一段响应体就调用：onChunk(data, len, cud);
-    // 然后回填：
     res->status = 200;   // HTTP 状态码
     res->error  = NULL;  // 传输失败时填错误串
     return 0;            // 完整往返返回 0，失败返回非 0
 }
 
-LlmmapiTransport t = { myPerform, NULL, NULL }; // perform, destroy, userdata
+LlmmapiTransport t = { myPerform, NULL, NULL };
 llmapiSetTransport(ctx, &t);
 ```
 
-### 消息内容
+### 2. 选择协议
 
-`content` 是自由文本：换行、制表符、非 ASCII（UTF-8）都可以。库会负责做 JSON 转义，
-所以多行的 system prompt、多行的用户文本都能原样送达。
+```c
+llmapiSetApi(ctx, LLMMAPI_API_OPENAI);           // 默认（chat completions）
+llmapiSetApi(ctx, LLMMAPI_API_OPENAI_RESPONSES); // /responses
+llmapiSetApi(ctx, LLMMAPI_API_ANTHROPIC);        // /messages
+```
 
-只有会进入 **HTTP 请求行或请求头**的取值才做 CRLF 注入校验：
+Anthropic 的 `baseUrl` 要带版本，例如 `https://api.anthropic.com/v1`
+（provider 会自动追加 `/messages`）。Responses 用
+`https://api.openai.com/v1`（会自动追加 `/responses`）。
 
-| 取值 | 是否校验 | 原因 |
-|------|----------|------|
-| `baseUrl` | 是 | 会拼成请求行（追加 `/chat/completions` 之后） |
-| `apiKey` | 是 | 会拼成 `Authorization: Bearer <key>` |
-| 消息 `role` | 是 | 必须是普通标识符 |
-| 消息 `content` | **否** | 进的是 JSON 请求体，正文里的换行是合法的 |
+`LLMMAPI_API_OPENAI_RESPONSES` 的映射：
+- system 消息 → 顶层 `instructions`
+- `max_tokens` → `max_output_tokens`
+- 工具调用/结果 → `function_call` / `function_call_output` items
+- `llmapiReqSetStop()` 会被忽略（Responses API 没有 `stop`）
 
-非法参数会被**静默忽略**：指针为 NULL，或 `role` 含 CRLF，都会直接丢掉这条消息而不报错。
-如果发出去的请求里消息条数比你添加的少，先检查 role。
-
-### 普通调用
+### 3. 普通调用
 
 ```c
 LlmmapiCtx* ctx = llmapiInit();
-
 LlmmapiTransport t = { myPerform, NULL, NULL };
 llmapiSetTransport(ctx, &t);
+llmapiSetApi(ctx, LLMMAPI_API_OPENAI);
 
 LlmmapiReq* req = llmapiReqNew("gpt-4");
 llmapiReqAddMsg(req, LLMAPI_ROLE_SYSTEM, "你是一个有用的助手。");
 llmapiReqAddMsg(req, LLMAPI_ROLE_USER,   "法国的首都是哪里？");
-llmapiReqSetTemperature(req, 0.7);
 llmapiReqSetMaxTokens(req, 200);
+llmapiReqSetTemperature(req, 0.7);
 
-char* resp = llmapiChatComplete(ctx, "https://api.openai.com/v1", "sk-...", req);
+LlmmapiResp* resp = llmapiChatComplete(ctx, "https://api.openai.com/v1",
+                                       "sk-...", req);
 if (resp)
 {
-    char* text = llmapiRespGetContent(resp, 0);
+    char* text = llmapiRespGetText(resp);
     printf("回复: %s\n", text);
     free(text);
-    printf("Tokens: %d\n", llmapiRespGetTotalTokens(resp));
-    free(resp);
+
+    long in, out, total;
+    llmapiRespGetUsage(resp, &in, &out, &total);
+    printf("Tokens: %ld\n", total);
+
+    llmapiRespFree(resp);
 }
 else
 {
@@ -89,163 +96,168 @@ llmapiReqFree(req);
 llmapiCleanup(ctx);
 ```
 
-### 流式调用（区分文本、思维链、工具调用）
+### 4. 流式调用
 
 ```c
-void onChunk(LlmmapiStreamType type, const char* content, int done, void* ud)
+static void onEvent(const LlmmapiStreamEvent* ev, void* ud)
 {
-    switch (type)
+    switch (ev->type)
     {
-        case LLMAPI_STREAM_TEXT:      printf("%s", content);              break;
-        case LLMAPI_STREAM_THINKING:  printf("[思考] %s", content);       break;
-        case LLMAPI_STREAM_TOOL_CALL: printf("[工具] %s", content);       break;
+        case LLMAPI_STREAM_TEXT:
+            printf("%s", ev->text ? ev->text : "");
+            break;
+        case LLMAPI_STREAM_THINKING:
+            printf("[思考] %s", ev->text ? ev->text : "");
+            break;
+        case LLMAPI_STREAM_TOOL_CALL:
+            printf("[工具 %zu %s] %s", ev->toolIndex,
+                   ev->toolName ? ev->toolName : "",
+                   ev->text ? ev->text : "");
+            break;
+        case LLMAPI_STREAM_DONE:
+            printf("\n[完成]\n");
+            break;
     }
-    if (done) printf("\n[完成]\n");
 }
 
-llmapiChatCompleteStream(ctx, url, key, req, onChunk, NULL);
+llmapiChatCompleteStream(ctx, url, key, req, onEvent, NULL);
+
+long total, in, out;
+llmapiStreamGetUsage(ctx, &total, &in, &out);
 ```
 
-### 连续对话
+工具参数是增量 JSON：把同一个 `ev->toolIndex` 的 `ev->text` 依次拼接即可。
+
+### 5. 多模态（图片 / 文件）
+
+库**不读文件、不做 base64**。在应用层生成 `data:` URL，再作为一个 part 加入：
 
 ```c
-char* resp = llmapiChatComplete(ctx, url, key, req);
-char* text = llmapiRespGetContent(resp, 0);
-llmapiReqAddMsg(req, LLMAPI_ROLE_ASSISTANT, text);  // 追加模型回复
-free(text);
-free(resp);
+LlmmapiMessage* m = llmapiReqAddMessage(req, LLMAPI_ROLE_USER);
+llmapiMsgAddText(m, "图里是什么？");
+llmapiMsgAddImage(m, "data:image/png;base64,iVBORw0KG...");   // 调用方编码
 
-llmapiReqAddMsg(req, LLMAPI_ROLE_USER, "下一个问题");
-resp = llmapiChatComplete(ctx, url, key, req);       // 带完整历史
+// PDF / 二进制文档（内联 data URL）
+llmapiMsgAddFile(m, "doc.pdf", "application/pdf",
+                 "data:application/pdf;base64,JVBERi0...");
 ```
 
-### 工具调用（Tool Calling）
+纯文本文件无需特殊处理——读成字符串后用 `llmapiReqAddMsg` 发送（支持多行）。
+
+### 6. 工具调用
 
 ```c
-// 提出需要工具的请求
-llmapiReqAddMsg(req, LLMAPI_ROLE_USER, "巴黎今天天气如何？");
-char* resp = llmapiChatComplete(ctx, url, key, req);
+// 定义工具（JSON Schema）
+llmapiReqAddTool(req, "get_weather", "查询天气",
+                 "{\"type\":\"object\",\"properties\":{"
+                 "\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}");
 
-// 解析工具调用请求
-char* tcJson = llmapiRespGetToolCallsJson(resp, 0);
-free(resp);
+LlmmapiResp* resp = llmapiChatComplete(ctx, url, key, req);
 
-// 追加 assistant 的 tool_calls 消息
-llmapiReqAddAssistantToolCalls(req, tcJson);
+// 遍历响应 parts
+const LlmmapiMessage* msg = llmapiRespGetMessage(resp);
+for (size_t i = 0; i < llmapiMessageGetPartCount(msg); i++)
+{
+    const LlmmapiPart* p = llmapiMessageGetPart(msg, i);
+    if (p->type == LLMMAPI_PART_TOOL_CALL)
+    {
+        printf("调用 %s %s(%s)\n", p->toolCallId, p->toolName, p->text);
 
-// 执行工具并追加结果
-llmapiReqAddToolResult(req, "call_123", "get_weather", "晴朗，22°C");
+        // 追加 assistant 的 tool call
+        LlmmapiMessage* a = llmapiReqAddMessage(req, LLMAPI_ROLE_ASSISTANT);
+        llmapiMsgAddToolCall(a, p->toolCallId, p->toolName, p->text);
 
-// 继续对话
+        // 追加工具结果
+        LlmmapiMessage* t = llmapiReqAddMessage(req, LLMAPI_ROLE_TOOL);
+        llmapiMsgAddToolResult(t, p->toolCallId, "晴朗，22°C");
+    }
+}
+
+llmapiRespFree(resp);
+
+// 带上工具结果继续问
 resp = llmapiChatComplete(ctx, url, key, req);
-char* answer = llmapiRespGetContent(resp, 0);
 ```
 
-### 额外参数
+provider 会自动翻译：
+- OpenAI：`tool_calls` / role `tool`
+- Anthropic：`tool_use` / `tool_result` content blocks
+
+### 7. 原始请求
+
+通过注入的 transport 发送任意字节（使用当前 provider 的鉴权方式）：
 
 ```c
-llmapiReqSet(req, "top_p",            "0.9");
-llmapiReqSet(req, "presence_penalty", "0.1");
-llmapiReqSet(req, "stop",             "[\"END\"]");
-llmapiReqSet(req, "seed",             "42");
-```
-
-### 多模态输入（原始 content parts）
-
-`llmapiReqAddMsgJson` 直接把 `content` 当成原始 JSON。库**不读文件、不做 base64**，
-数组由调用方自己拼（base64 在你的应用层完成）：
-
-```c
-// data: URL 由调用方生成（base64 在库外完成）
-const char* parts =
-    "[{\"type\":\"text\",\"text\":\"图里是什么？\"},"
-    " {\"type\":\"image_url\","
-    "  \"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KG...\"}}]";
-
-llmapiReqAddMsgJson(req, LLMAPI_ROLE_USER, parts);
-char* resp = llmapiChatComplete(ctx, url, key, req);
-```
-
-纯文本文件无需特殊处理——读成字符串后用 `llmapiReqAddMsg` 发即可（支持多行）。
-
-### 原始请求
-
-`llmapiRequest` 通过注入的 transport 发送任意字节，只额外设置
-`Content-Type`（给了才设）和 `Authorization: Bearer <apiKey>`（apiKey 非 NULL 时）：
-
-```c
-// 例如：调用方自己拼好的 multipart 上传到 Files API
 char* resp = llmapiRequest(ctx, "https://api.openai.com/v1", "sk-...",
                            "POST", "/files",
                            "multipart/form-data; boundary=----xyz",
                            multipartBody, multipartLen);
 ```
 
-> 该函数会把整个响应缓冲下来；聊天场景优先用上层接口。
+会把整个响应缓冲后返回，不适合流式。
 
 ## API 一览
 
-### 生命周期 / 错误
+### 生命周期 / 错误 / 传输 / 协议
 
 | 函数 | 说明 |
 |------|------|
 | `llmapiInit()` / `llmapiCleanup()` | 生命周期 |
 | `llmapiStrError(ctx)` | 错误信息 |
+| `llmapiSetTransport(ctx, &t)` | 注入 HTTP 传输层（必需） |
+| `llmapiSetApi(ctx, api)` | 选择 `LLMMAPI_API_OPENAI` / `LLMMAPI_API_OPENAI_RESPONSES` / `LLMMAPI_API_ANTHROPIC` |
 
-### 传输层
+### 中立模型
 
-| 函数 | 说明 |
-|------|------|
-| `llmapiSetTransport(ctx, &t)` | 注入 HTTP 传输层（调用前必需） |
-| `LlmmapiTransport` | `{ perform, destroy, userdata }` 回调结构体 |
-| `LlmmapiHttpRequest` / `LlmmapiHttpResult` | 传给传输层的请求 / 由传输层回填的结果 |
-| `LlmmapiWriteFn` | 响应体分块回调 |
+| 类型 / 函数 | 说明 |
+|-------------|------|
+| `LlmmapiPart` / `LlmmapiPartType` | 文本、图片、文件、思考、工具调用、工具结果 |
+| `LlmmapiMessage` | role + parts |
+| `llmapiMessageGetPartCount(msg)` | part 数量 |
+| `llmapiMessageGetPart(msg, idx)` | 借用的 part 指针 |
 
 ### 请求
 
 | 函数 | 说明 |
 |------|------|
 | `llmapiReqNew(model)` / `llmapiReqFree(req)` | 请求生命周期 |
-| `llmapiReqAddMsg(req, role, content)` | 添加消息 (role: system/user/assistant/tool)，content 可多行 |
-| `llmapiReqAddMsgJson(req, role, json)` | 添加 content 为原始 JSON parts 的消息（库不做编码） |
-| `llmapiReqAddAssistantToolCalls(req, json)` | 添加带 tool_calls 的 assistant 消息 |
-| `llmapiReqAddToolResult(req, id, name, content)` | 添加工具执行结果消息 |
-| `llmapiReqSetMaxTokens(req, n)` | 设置 max_tokens |
-| `llmapiReqSetTemperature(req, t)` | 设置 temperature |
-| `llmapiReqSet(req, key, jsonValue)` | 通用参数 |
+| `llmapiReqAddMessage(req, role)` | 添加消息，返回可写句柄 |
+| `llmapiReqAddMsg(req, role, text)` | 便捷：加一条单 TEXT 消息 |
+| `llmapiMsgAddText(msg, text)` | 添加 TEXT |
+| `llmapiMsgAddImage(msg, url)` | 添加 IMAGE（http(s) 或 data: URL） |
+| `llmapiMsgAddFile(msg, filename, mime, dataUrlOrFileId)` | 添加 FILE |
+| `llmapiMsgAddToolCall(msg, id, name, argsJson)` | 添加 TOOL_CALL |
+| `llmapiMsgAddToolResult(msg, id, content)` | 添加 TOOL_RESULT |
+| `llmapiReqAddTool(req, name, description, schemaJson)` | 定义工具 |
+| `llmapiReqSetMaxTokens` / `SetTemperature` / `SetTopP` | 生成参数 |
+| `llmapiReqSetStop(req, jsonArray)` | 停止序列 |
+| `llmapiReqSetExtra(req, key, json)` | provider 原生顶层参数 |
 
 ### 调用
 
 | 函数 | 说明 |
 |------|------|
-| `llmapiChatComplete(ctx, url, key, req)` | 普通调用，返回 JSON 字符串 |
-| `llmapiChatCompleteStream(ctx, url, key, req, cb, ud)` | 流式调用，类型感知回调 |
-| `llmapiStreamGetUsage(ctx, &total, &prompt, &comp)` | 获取上一次流式调用的 token 用量 |
+| `llmapiChatComplete(...)` | 同步调用，返回 `LlmmapiResp*` |
+| `llmapiChatCompleteStream(..., cb, ud)` | 流式调用，中立事件 |
+| `llmapiStreamGetUsage(ctx, &total, &in, &out)` | 上一次流式调用的用量 |
+
+### 响应
+
+| 函数 | 说明 |
+|------|------|
+| `llmapiRespGetMessage(resp)` | 借用的 assistant 消息 |
+| `llmapiRespGetText(resp)` | 拼接后的 TEXT（malloc） |
+| `llmapiRespGetThinking(resp)` | 拼接后的 THINKING（malloc） |
+| `llmapiRespGetFinishReason(resp)` | 借用的结束原因 |
+| `llmapiRespGetUsage(resp, &in, &out, &total)` | token 用量 |
+| `llmapiRespGetRawJson(resp)` | 借用的原始响应 |
+| `llmapiRespFree(resp)` | 释放响应 |
 
 ### 原始请求
 
 | 函数 | 说明 |
 |------|------|
-| `llmapiRequest(ctx, url, key, method, path, contentType, body, len)` | 经 transport 发送任意字节，返回缓冲后的响应体 |
-
-### 响应提取
-
-| 函数 | 说明 |
-|------|------|
-| `llmapiRespGetContent(json, idx)` | 提取 `choices[idx].message.content` |
-| `llmapiRespGetReasoningContent(json, idx)` | 提取 `choices[idx].message.reasoning_content` |
-| `llmapiRespGetToolCallsJson(json, idx)` | 序列化 `choices[idx].message.tool_calls` |
-| `llmapiRespGetTotalTokens(json)` | `usage.total_tokens` |
-| `llmapiRespGetPromptTokens(json)` | `usage.prompt_tokens` |
-| `llmapiRespGetCompletionTokens(json)` | `usage.completion_tokens` |
-
-### 流式回调类型
-
-| 值 | 含义 |
-|----|------|
-| `LLMAPI_STREAM_TEXT` | 普通回复文本 |
-| `LLMAPI_STREAM_THINKING` | 思维链 / 思考过程 (DeepSeek-R1 等) |
-| `LLMAPI_STREAM_TOOL_CALL` | 工具调用增量 (JSON 字符串) |
+| `llmapiRequest(ctx, url, key, method, path, contentType, body, len)` | 发送任意字节，返回缓冲后的响应体 |
 
 ## 协议
 
