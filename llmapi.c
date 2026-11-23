@@ -195,6 +195,10 @@ struct LlmmapiReq
     size_t   toolCount;
     size_t   toolCap;
 
+    char** rawTools;   // provider-native tool objects (JSON object strings)
+    size_t rawToolCount;
+    size_t rawToolCap;
+
     int    hasMaxTokens;
     size_t maxTokens;
 
@@ -234,6 +238,10 @@ struct LlmmapiResp
     long           outputTokens;
     long           totalTokens;
     char*          rawJson;
+
+    LlmmapiCitation* citations;
+    size_t           citationCount;
+    size_t           citationCap;
 };
 
 // ==================== Internal: String helpers ====================
@@ -304,6 +312,8 @@ static void llmPartFree(LlmmapiPart* p)
     free(p->fileId);
     free(p->toolCallId);
     free(p->toolName);
+    free(p->provider);
+    free(p->rawJson);
 
     memset(p, 0, sizeof(*p));
 }
@@ -396,6 +406,32 @@ static int llmMessageHasPart(const LlmmapiMessage* msg, LlmmapiPartType type)
     return 0;
 }
 
+// True when the message has at least one part and every part is a RAW_BLOCK
+// that does not belong to `provider` (so the whole message can be skipped).
+static int llmMessageAllRawExcluded(const LlmmapiMessage* msg,
+                                    const char* provider)
+{
+    if (msg->partCount == 0)
+    {
+        return 0;
+    }
+
+    for (size_t i = 0; i < msg->partCount; i++)
+    {
+        const LlmmapiPart* p = &msg->parts[i];
+        if (p->type != LLMMAPI_PART_RAW_BLOCK)
+        {
+            return 0;
+        }
+        if (p->provider != NULL && strcmp(p->provider, provider) == 0)
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
 static char* llmConcatParts(const LlmmapiMessage* msg, LlmmapiPartType type)
 {
     LlmBuf buf;
@@ -416,6 +452,32 @@ static char* llmConcatParts(const LlmmapiMessage* msg, LlmmapiPartType type)
     }
 
     return llmBufDetach(&buf);
+}
+
+// ==================== Internal: Citation helpers ====================
+
+static LlmmapiCitation* llmRespAddCitation(LlmmapiResp* resp)
+{
+    if (resp->citationCount >= resp->citationCap)
+    {
+        size_t newCap = resp->citationCap == 0 ? 4 : resp->citationCap * 2;
+        LlmmapiCitation* p = (LlmmapiCitation*)realloc(
+            resp->citations, newCap * sizeof(LlmmapiCitation));
+        if (p == NULL)
+        {
+            return NULL;
+        }
+
+        resp->citations   = p;
+        resp->citationCap = newCap;
+    }
+
+    LlmmapiCitation* c = &resp->citations[resp->citationCount++];
+    memset(c, 0, sizeof(*c));
+    c->startIndex = -1;
+    c->endIndex   = -1;
+
+    return c;
 }
 
 // ==================== Public: Message accessors ====================
@@ -568,6 +630,12 @@ void llmapiReqFree(LlmmapiReq* req)
         free(req->tools[i].parametersJson);
     }
     free(req->tools);
+
+    for (size_t i = 0; i < req->rawToolCount; i++)
+    {
+        free(req->rawTools[i]);
+    }
+    free(req->rawTools);
 
     free(req->stopJson);
 
@@ -736,6 +804,44 @@ void llmapiMsgAddToolResult(LlmmapiMessage* msg, const char* toolCallId,
     }
 }
 
+int llmapiMsgAddRawBlock(LlmmapiMessage* msg,
+                         const char* provider,
+                         const char* jsonObject)
+{
+    if (msg == NULL || provider == NULL || jsonObject == NULL)
+    {
+        return -1;
+    }
+
+    cJSON* parsed = cJSON_Parse(jsonObject);
+    if (parsed == NULL || !cJSON_IsObject(parsed))
+    {
+        cJSON_Delete(parsed);
+        return -1;
+    }
+    cJSON_Delete(parsed);
+
+    LlmmapiPart p;
+    memset(&p, 0, sizeof(p));
+    p.type     = LLMMAPI_PART_RAW_BLOCK;
+    p.provider = llmStrDup(provider);
+    p.rawJson  = llmStrDup(jsonObject);
+
+    if (p.provider == NULL || p.rawJson == NULL)
+    {
+        llmPartFree(&p);
+        return -1;
+    }
+
+    if (llmMessageAddPart(msg, &p) != 0)
+    {
+        llmPartFree(&p);
+        return -1;
+    }
+
+    return 0;
+}
+
 void llmapiReqAddTool(LlmmapiReq* req, const char* name,
                       const char* description, const char* parametersJson)
 {
@@ -770,6 +876,45 @@ void llmapiReqAddTool(LlmmapiReq* req, const char* name,
     }
 
     req->tools[req->toolCount++] = tool;
+}
+
+int llmapiReqAddRawTool(LlmmapiReq* req, const char* jsonObject)
+{
+    if (req == NULL || jsonObject == NULL)
+    {
+        return -1;
+    }
+
+    cJSON* parsed = cJSON_Parse(jsonObject);
+    if (parsed == NULL || !cJSON_IsObject(parsed))
+    {
+        cJSON_Delete(parsed);
+        return -1;
+    }
+    cJSON_Delete(parsed);
+
+    if (req->rawToolCount >= req->rawToolCap)
+    {
+        size_t newCap = req->rawToolCap == 0 ? 4 : req->rawToolCap * 2;
+        char** p = (char**)realloc(req->rawTools, newCap * sizeof(char*));
+        if (p == NULL)
+        {
+            return -1;
+        }
+
+        req->rawTools   = p;
+        req->rawToolCap = newCap;
+    }
+
+    char* copy = llmStrDup(jsonObject);
+    if (copy == NULL)
+    {
+        return -1;
+    }
+
+    req->rawTools[req->rawToolCount++] = copy;
+
+    return 0;
 }
 
 void llmapiReqSetMaxTokens(LlmmapiReq* req, size_t maxTokens)
@@ -935,7 +1080,26 @@ static void llmAddJsonValue(cJSON* root, const char* key, const char* value)
     }
 }
 
+// Append provider-native tool objects verbatim to a "tools" array.
+static void llmAppendRawTools(const LlmmapiReq* req, cJSON* tools)
+{
+    for (size_t i = 0; i < req->rawToolCount; i++)
+    {
+        cJSON* t = cJSON_Parse(req->rawTools[i]);
+        if (t != NULL && cJSON_IsObject(t))
+        {
+            cJSON_AddItemToArray(tools, t);
+        }
+        else
+        {
+            cJSON_Delete(t);
+        }
+    }
+}
+
 // ==================== Internal: Provider interface ====================
+
+#define LLMAPI_MAX_SERVER_TOOLS 64
 
 typedef struct
 {
@@ -944,6 +1108,11 @@ typedef struct
     int             done;
     long            inputTokens;
     long            outputTokens;
+
+    int             hadCitation;
+    size_t serverToolCount;
+    size_t serverToolIndex[LLMAPI_MAX_SERVER_TOOLS];
+    char*  serverToolName[LLMAPI_MAX_SERVER_TOOLS];
 } LlmStreamSink;
 
 static void llmEmit(LlmStreamSink* sink, LlmmapiStreamType type,
@@ -956,8 +1125,107 @@ static void llmEmit(LlmStreamSink* sink, LlmmapiStreamType type,
     ev.toolCallId = toolCallId;
     ev.toolName   = toolName;
     ev.toolIndex  = toolIndex;
+    ev.citation   = NULL;
+    ev.status     = NULL;
 
     sink->cb(&ev, sink->userdata);
+}
+
+static void llmEmitCitation(LlmStreamSink* sink,
+                            const LlmmapiCitation* citation)
+{
+    LlmmapiStreamEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type     = LLMAPI_STREAM_CITATION;
+    ev.citation = citation;
+
+    sink->hadCitation = 1;
+    sink->cb(&ev, sink->userdata);
+}
+
+static void llmEmitServerTool(LlmStreamSink* sink, const char* name,
+                              const char* status, size_t index)
+{
+    LlmmapiStreamEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type      = LLMAPI_STREAM_SERVER_TOOL;
+    ev.text      = name;
+    ev.status    = status;
+    ev.toolIndex = index;
+
+    sink->cb(&ev, sink->userdata);
+}
+
+static void llmEmitCitationArray(cJSON* annotations, LlmStreamSink* sink)
+{
+    if (annotations == NULL || !cJSON_IsArray(annotations))
+    {
+        return;
+    }
+
+    cJSON* a = NULL;
+    cJSON_ArrayForEach(a, annotations)
+    {
+        const char* atype = llmJsonStr(a, "type");
+        if (atype == NULL || strcmp(atype, "url_citation") != 0)
+        {
+            continue;
+        }
+
+        const char* url = llmJsonStr(a, "url");
+        if (url == NULL)
+        {
+            continue;
+        }
+
+        LlmmapiCitation c;
+        memset(&c, 0, sizeof(c));
+        c.url        = url;
+        c.title      = llmJsonStr(a, "title");
+        c.startIndex = -1;
+        c.endIndex   = -1;
+        llmJsonLong(a, "start_index", &c.startIndex);
+        llmJsonLong(a, "end_index", &c.endIndex);
+
+        llmEmitCitation(sink, &c);
+    }
+}
+
+static void llmSinkRememberServerTool(LlmStreamSink* sink, size_t index,
+                                      const char* name)
+{
+    if (sink->serverToolCount >= LLMAPI_MAX_SERVER_TOOLS)
+    {
+        return;
+    }
+
+    sink->serverToolIndex[sink->serverToolCount] = index;
+    sink->serverToolName[sink->serverToolCount]  = llmStrDup(name);
+    sink->serverToolCount++;
+}
+
+static const char* llmSinkFindServerTool(const LlmStreamSink* sink,
+                                         size_t index)
+{
+    for (size_t i = 0; i < sink->serverToolCount; i++)
+    {
+        if (sink->serverToolIndex[i] == index)
+        {
+            return sink->serverToolName[i];
+        }
+    }
+
+    return NULL;
+}
+
+static void llmSinkFreeServerTools(LlmStreamSink* sink)
+{
+    for (size_t i = 0; i < sink->serverToolCount; i++)
+    {
+        free(sink->serverToolName[i]);
+        sink->serverToolName[i] = NULL;
+    }
+    sink->serverToolCount = 0;
 }
 
 typedef struct
@@ -1023,10 +1291,31 @@ static void openaiAddContentPart(cJSON* content, const LlmmapiPart* part)
         }
         cJSON_AddItemToArray(content, b);
     }
+    else if (part->type == LLMMAPI_PART_RAW_BLOCK)
+    {
+        if (part->provider != NULL && part->rawJson != NULL &&
+            strcmp(part->provider, "openai") == 0)
+        {
+            cJSON* obj = cJSON_Parse(part->rawJson);
+            if (obj != NULL && cJSON_IsObject(obj))
+            {
+                cJSON_AddItemToArray(content, obj);
+            }
+            else
+            {
+                cJSON_Delete(obj);
+            }
+        }
+    }
 }
 
 static int openaiEncodeMessage(const LlmmapiMessage* msg, cJSON* msgs)
 {
+    if (llmMessageAllRawExcluded(msg, "openai"))
+    {
+        return 0;
+    }
+
     // Tool results become one "tool" message per result.
     if (llmMessageHasPart(msg, LLMMAPI_PART_TOOL_RESULT) ||
         strcmp(msg->role, LLMAPI_ROLE_TOOL) == 0)
@@ -1109,7 +1398,8 @@ static int openaiEncodeMessage(const LlmmapiMessage* msg, cJSON* msgs)
     for (size_t i = 0; i < msg->partCount; i++)
     {
         LlmmapiPartType t = msg->parts[i].type;
-        if (t == LLMMAPI_PART_IMAGE || t == LLMMAPI_PART_FILE)
+        if (t == LLMMAPI_PART_IMAGE || t == LLMMAPI_PART_FILE ||
+            t == LLMMAPI_PART_RAW_BLOCK)
         {
             hasMultipart = 1;
             break;
@@ -1141,7 +1431,7 @@ static int openaiEncodeMessage(const LlmmapiMessage* msg, cJSON* msgs)
 
 static void openaiAddTools(const LlmmapiReq* req, cJSON* root)
 {
-    if (req->toolCount == 0)
+    if (req->toolCount == 0 && req->rawToolCount == 0)
     {
         return;
     }
@@ -1182,6 +1472,8 @@ static void openaiAddTools(const LlmmapiReq* req, cJSON* root)
         }
         cJSON_AddItemToArray(tools, t);
     }
+
+    llmAppendRawTools(req, tools);
 }
 
 static void llmAddCommonParams(const LlmmapiReq* req, cJSON* root, int stream,
@@ -1532,6 +1824,11 @@ static int anthropicAddFile(cJSON* content, const LlmmapiPart* part)
 static int anthropicEncodeMessage(LlmmapiCtx* ctx, const LlmmapiMessage* msg,
                                   cJSON* msgs)
 {
+    if (llmMessageAllRawExcluded(msg, "anthropic"))
+    {
+        return 0;
+    }
+
     int isTool = (strcmp(msg->role, LLMAPI_ROLE_TOOL) == 0) ||
                  llmMessageHasPart(msg, LLMMAPI_PART_TOOL_RESULT);
 
@@ -1614,6 +1911,22 @@ static int anthropicEncodeMessage(LlmmapiCtx* ctx, const LlmmapiMessage* msg,
 
             cJSON_AddItemToArray(content, b);
         }
+        else if (part->type == LLMMAPI_PART_RAW_BLOCK)
+        {
+            if (part->provider != NULL && part->rawJson != NULL &&
+                strcmp(part->provider, "anthropic") == 0)
+            {
+                cJSON* obj = cJSON_Parse(part->rawJson);
+                if (obj != NULL && cJSON_IsObject(obj))
+                {
+                    cJSON_AddItemToArray(content, obj);
+                }
+                else
+                {
+                    cJSON_Delete(obj);
+                }
+            }
+        }
         // THINKING and TOOL_RESULT are not sent back as input.
     }
 
@@ -1624,7 +1937,7 @@ static int anthropicEncodeMessage(LlmmapiCtx* ctx, const LlmmapiMessage* msg,
 
 static void anthropicAddTools(const LlmmapiReq* req, cJSON* root)
 {
-    if (req->toolCount == 0)
+    if (req->toolCount == 0 && req->rawToolCount == 0)
     {
         return;
     }
@@ -1661,6 +1974,8 @@ static void anthropicAddTools(const LlmmapiReq* req, cJSON* root)
 
         cJSON_AddItemToArray(tools, t);
     }
+
+    llmAppendRawTools(req, tools);
 }
 
 static int anthropicEncode(LlmmapiCtx* ctx, const LlmmapiReq* req, int stream,
@@ -1865,6 +2180,32 @@ static int anthropicDecode(LlmmapiCtx* ctx, const char* rawJson,
             {
                 llmAddTextPart(&out->message, LLMMAPI_PART_TEXT,
                                llmJsonStr(block, "text"));
+
+                cJSON* citations = cJSON_GetObjectItem(block, "citations");
+                if (citations != NULL && cJSON_IsArray(citations))
+                {
+                    cJSON* cit = NULL;
+                    cJSON_ArrayForEach(cit, citations)
+                    {
+                        const char* url = llmJsonStr(cit, "url");
+                        if (url == NULL)
+                        {
+                            continue;
+                        }
+
+                        LlmmapiCitation* c = llmRespAddCitation(out);
+                        if (c == NULL)
+                        {
+                            continue;
+                        }
+
+                        c->url       = llmStrDup(url);
+                        c->title     = llmStrDup(llmJsonStr(cit, "title"));
+                        c->citedText = llmStrDup(llmJsonStr(cit, "cited_text"));
+                        llmJsonLong(cit, "start_char_index", &c->startIndex);
+                        llmJsonLong(cit, "end_char_index", &c->endIndex);
+                    }
+                }
             }
             else if (strcmp(type, "thinking") == 0)
             {
@@ -1886,6 +2227,25 @@ static int anthropicDecode(LlmmapiCtx* ctx, const char* rawJson,
                 if (p->text == NULL)
                 {
                     p->text = llmStrDup("{}");
+                }
+            }
+            else
+            {
+                // Preserve provider-native blocks (server_tool_use,
+                // web_search_tool_result, redacted_thinking, ...) so callers
+                // can replay them in later turns.
+                char* raw = cJSON_PrintUnformatted(block);
+                if (raw != NULL)
+                {
+                    LlmmapiPart* p = llmMessageNewPart(&out->message);
+                    if (p != NULL)
+                    {
+                        p->type     = LLMMAPI_PART_RAW_BLOCK;
+                        p->provider = llmStrDup("anthropic");
+                        p->rawJson  = raw;
+                        raw = NULL;
+                    }
+                    free(raw);
                 }
             }
         }
@@ -1956,6 +2316,12 @@ static void anthropicStreamDecode(const char* payload, LlmStreamSink* sink)
                     llmJsonStr(block, "id"), llmJsonStr(block, "name"),
                     index);
         }
+        else if (btype != NULL && strcmp(btype, "server_tool_use") == 0)
+        {
+            const char* name = llmJsonStr(block, "name");
+            llmEmitServerTool(sink, name, "started", index);
+            llmSinkRememberServerTool(sink, index, name);
+        }
     }
     else if (strcmp(type, "content_block_delta") == 0)
     {
@@ -1984,8 +2350,49 @@ static void anthropicStreamDecode(const char* payload, LlmStreamSink* sink)
         }
         else if (strcmp(dtype, "input_json_delta") == 0)
         {
-            llmEmit(sink, LLMAPI_STREAM_TOOL_CALL,
-                    llmJsonStr(delta, "partial_json"), NULL, NULL, index);
+            // Server-side tools stream their input too; don't surface it as a
+            // client tool call.
+            if (llmSinkFindServerTool(sink, index) == NULL)
+            {
+                llmEmit(sink, LLMAPI_STREAM_TOOL_CALL,
+                        llmJsonStr(delta, "partial_json"), NULL, NULL, index);
+            }
+        }
+        else if (strcmp(dtype, "citations_delta") == 0)
+        {
+            cJSON* cit = cJSON_GetObjectItem(delta, "citation");
+            if (cit != NULL)
+            {
+                LlmmapiCitation c;
+                memset(&c, 0, sizeof(c));
+                c.url        = llmJsonStr(cit, "url");
+                c.title      = llmJsonStr(cit, "title");
+                c.citedText  = llmJsonStr(cit, "cited_text");
+                c.startIndex = -1;
+                c.endIndex   = -1;
+                llmJsonLong(cit, "start_char_index", &c.startIndex);
+                llmJsonLong(cit, "end_char_index", &c.endIndex);
+
+                if (c.url != NULL)
+                {
+                    llmEmitCitation(sink, &c);
+                }
+            }
+        }
+    }
+    else if (strcmp(type, "content_block_stop") == 0)
+    {
+        size_t index = 0;
+        cJSON* idx = cJSON_GetObjectItem(root, "index");
+        if (idx != NULL && cJSON_IsNumber(idx))
+        {
+            index = (size_t)idx->valuedouble;
+        }
+
+        const char* name = llmSinkFindServerTool(sink, index);
+        if (name != NULL)
+        {
+            llmEmitServerTool(sink, name, "completed", index);
         }
     }
     else if (strcmp(type, "message_delta") == 0)
@@ -2117,6 +2524,41 @@ static int responsesEncode(LlmmapiCtx* ctx, const LlmmapiReq* req, int stream,
             continue;
         }
 
+        // Provider-native output items (e.g. web_search_call) are replayed
+        // as top-level input items for the Responses API.
+        int hadRawBlock = 0;
+        int hasNonRawPart = 0;
+        for (size_t j = 0; j < msg->partCount; j++)
+        {
+            const LlmmapiPart* part = &msg->parts[j];
+            if (part->type == LLMMAPI_PART_RAW_BLOCK)
+            {
+                if (part->provider != NULL && part->rawJson != NULL &&
+                    strcmp(part->provider, "openai-responses") == 0)
+                {
+                    cJSON* obj = cJSON_Parse(part->rawJson);
+                    if (obj != NULL && cJSON_IsObject(obj))
+                    {
+                        cJSON_AddItemToArray(input, obj);
+                    }
+                    else
+                    {
+                        cJSON_Delete(obj);
+                    }
+                }
+                hadRawBlock = 1;
+            }
+            else
+            {
+                hasNonRawPart = 1;
+            }
+        }
+
+        if (hadRawBlock && !hasNonRawPart)
+        {
+            continue;
+        }
+
         // Tool results are top-level function_call_output items.
         if (strcmp(msg->role, LLMAPI_ROLE_TOOL) == 0 ||
             llmMessageHasPart(msg, LLMMAPI_PART_TOOL_RESULT))
@@ -2233,7 +2675,7 @@ static int responsesEncode(LlmmapiCtx* ctx, const LlmmapiReq* req, int stream,
     }
 
     // Tools use the flat Responses schema (no nested "function" object).
-    if (req->toolCount > 0)
+    if (req->toolCount > 0 || req->rawToolCount > 0)
     {
         cJSON* tools = cJSON_AddArrayToObject(root, "tools");
         if (tools != NULL)
@@ -2267,6 +2709,8 @@ static int responsesEncode(LlmmapiCtx* ctx, const LlmmapiReq* req, int stream,
 
                 cJSON_AddItemToArray(tools, t);
             }
+
+            llmAppendRawTools(req, tools);
         }
     }
 
@@ -2345,6 +2789,47 @@ static int responsesDecode(LlmmapiCtx* ctx, const char* rawJson,
                         {
                             llmAddTextPart(&out->message, LLMMAPI_PART_TEXT,
                                            llmJsonStr(part, "text"));
+
+                            cJSON* annotations =
+                                cJSON_GetObjectItem(part, "annotations");
+                            if (annotations != NULL &&
+                                cJSON_IsArray(annotations))
+                            {
+                                cJSON* a = NULL;
+                                cJSON_ArrayForEach(a, annotations)
+                                {
+                                    const char* atype =
+                                        llmJsonStr(a, "type");
+                                    if (atype == NULL ||
+                                        strcmp(atype, "url_citation") != 0)
+                                    {
+                                        continue;
+                                    }
+
+                                    const char* url = llmJsonStr(a, "url");
+                                    if (url == NULL)
+                                    {
+                                        continue;
+                                    }
+
+                                    LlmmapiCitation* c =
+                                        llmRespAddCitation(out);
+                                    if (c == NULL)
+                                    {
+                                        continue;
+                                    }
+
+                                    c->url        = llmStrDup(url);
+                                    c->title      = llmStrDup(
+                                        llmJsonStr(a, "title"));
+                                    c->startIndex = -1;
+                                    c->endIndex   = -1;
+                                    llmJsonLong(a, "start_index",
+                                                &c->startIndex);
+                                    llmJsonLong(a, "end_index",
+                                                &c->endIndex);
+                                }
+                            }
                         }
                     }
                 }
@@ -2387,6 +2872,24 @@ static int responsesDecode(LlmmapiCtx* ctx, const char* rawJson,
                     }
                 }
             }
+            else
+            {
+                // Preserve provider-native output items (web_search_call, ...)
+                // so callers can replay them.
+                char* raw = cJSON_PrintUnformatted(item);
+                if (raw != NULL)
+                {
+                    LlmmapiPart* p = llmMessageNewPart(&out->message);
+                    if (p != NULL)
+                    {
+                        p->type     = LLMMAPI_PART_RAW_BLOCK;
+                        p->provider = llmStrDup("openai-responses");
+                        p->rawJson  = raw;
+                        raw = NULL;
+                    }
+                    free(raw);
+                }
+            }
         }
     }
 
@@ -2426,9 +2929,26 @@ static int responsesDecode(LlmmapiCtx* ctx, const char* rawJson,
     cJSON* error = cJSON_GetObjectItem(root, "error");
     if (error != NULL && !cJSON_IsNull(error))
     {
+        const char* etype   = llmJsonStr(error, "type");
         const char* message = llmJsonStr(error, "message");
-        llmBufAppend(&ctx->errbuf,
-                     message ? message : "Responses API error");
+
+        if (etype != NULL && message != NULL)
+        {
+            llmBufAppendFmt(&ctx->errbuf, "%s: %s", etype, message);
+        }
+        else if (message != NULL)
+        {
+            llmBufAppend(&ctx->errbuf, message);
+        }
+        else if (etype != NULL)
+        {
+            llmBufAppend(&ctx->errbuf, etype);
+        }
+        else
+        {
+            llmBufAppend(&ctx->errbuf, "Responses API error");
+        }
+
         cJSON_Delete(root);
         return -1;
     }
@@ -2470,6 +2990,10 @@ static void responsesStreamDecode(const char* payload, LlmStreamSink* sink)
                     llmJsonStr(item, "call_id"), llmJsonStr(item, "name"),
                     index);
         }
+        else if (itype != NULL && strcmp(itype, "web_search_call") == 0)
+        {
+            llmEmitServerTool(sink, "web_search", "started", index);
+        }
     }
     else if (strcmp(type, "response.output_text.delta") == 0)
     {
@@ -2487,6 +3011,42 @@ static void responsesStreamDecode(const char* payload, LlmStreamSink* sink)
         llmEmit(sink, LLMAPI_STREAM_THINKING, llmJsonStr(root, "delta"),
                 NULL, NULL, index);
     }
+    else if (strcmp(type, "response.output_text.annotation.added") == 0)
+    {
+        cJSON* a = cJSON_GetObjectItem(root, "annotation");
+        if (a != NULL)
+        {
+            const char* atype = llmJsonStr(a, "type");
+            if (atype != NULL && strcmp(atype, "url_citation") == 0)
+            {
+                const char* url = llmJsonStr(a, "url");
+                if (url != NULL)
+                {
+                    LlmmapiCitation c;
+                    memset(&c, 0, sizeof(c));
+                    c.url        = url;
+                    c.title      = llmJsonStr(a, "title");
+                    c.startIndex = -1;
+                    c.endIndex   = -1;
+                    llmJsonLong(a, "start_index", &c.startIndex);
+                    llmJsonLong(a, "end_index", &c.endIndex);
+                    llmEmitCitation(sink, &c);
+                }
+            }
+        }
+    }
+    else if (strcmp(type, "response.web_search_call.in_progress") == 0)
+    {
+        llmEmitServerTool(sink, "web_search", "in_progress", index);
+    }
+    else if (strcmp(type, "response.web_search_call.searching") == 0)
+    {
+        llmEmitServerTool(sink, "web_search", "searching", index);
+    }
+    else if (strcmp(type, "response.web_search_call.completed") == 0)
+    {
+        llmEmitServerTool(sink, "web_search", "completed", index);
+    }
     else if (strcmp(type, "response.completed") == 0 ||
              strcmp(type, "response.incomplete") == 0 ||
              strcmp(type, "response.failed") == 0)
@@ -2503,6 +3063,44 @@ static void responsesStreamDecode(const char* payload, LlmStreamSink* sink)
             if (llmJsonLong(usage, "output_tokens", &outTok))
             {
                 sink->outputTokens = outTok;
+            }
+        }
+
+        // Fallback: some providers only carry annotations in the final payload.
+        if (!sink->hadCitation && response != NULL)
+        {
+            cJSON* output = cJSON_GetObjectItem(response, "output");
+            if (output != NULL && cJSON_IsArray(output))
+            {
+                cJSON* oitem = NULL;
+                cJSON_ArrayForEach(oitem, output)
+                {
+                    const char* otype = llmJsonStr(oitem, "type");
+                    if (otype == NULL || strcmp(otype, "message") != 0)
+                    {
+                        continue;
+                    }
+
+                    cJSON* content = cJSON_GetObjectItem(oitem, "content");
+                    if (content == NULL || !cJSON_IsArray(content))
+                    {
+                        continue;
+                    }
+
+                    cJSON* part = NULL;
+                    cJSON_ArrayForEach(part, content)
+                    {
+                        const char* ptype = llmJsonStr(part, "type");
+                        if (ptype == NULL ||
+                            strcmp(ptype, "output_text") != 0)
+                        {
+                            continue;
+                        }
+
+                        llmEmitCitationArray(
+                            cJSON_GetObjectItem(part, "annotations"), sink);
+                    }
+                }
             }
         }
 
@@ -2967,6 +3565,8 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
     sctx.sink.done       = 0;
     sctx.sink.inputTokens  = 0;
     sctx.sink.outputTokens = 0;
+    sctx.sink.hadCitation  = 0;
+    sctx.sink.serverToolCount = 0;
 
     LlmmapiHttpRequest httpReq;
     httpReq.method    = "POST";
@@ -2992,6 +3592,7 @@ int llmapiChatCompleteStream(LlmmapiCtx* ctx,
         llmProcessSseLine(&sctx, sctx.lineBuf.data, sctx.lineBuf.len);
     }
     llmBufFree(&sctx.lineBuf);
+    llmSinkFreeServerTools(&sctx.sink);
 
     ctx->lastPromptTokens     = sctx.sink.inputTokens;
     ctx->lastCompletionTokens = sctx.sink.outputTokens;
@@ -3083,6 +3684,22 @@ const char* llmapiRespGetRawJson(const LlmmapiResp* resp)
     return resp ? resp->rawJson : NULL;
 }
 
+size_t llmapiRespGetCitationCount(const LlmmapiResp* resp)
+{
+    return resp ? resp->citationCount : 0;
+}
+
+const LlmmapiCitation* llmapiRespGetCitation(const LlmmapiResp* resp,
+                                             size_t idx)
+{
+    if (resp == NULL || idx >= resp->citationCount)
+    {
+        return NULL;
+    }
+
+    return &resp->citations[idx];
+}
+
 void llmapiRespFree(LlmmapiResp* resp)
 {
     if (resp == NULL)
@@ -3093,6 +3710,15 @@ void llmapiRespFree(LlmmapiResp* resp)
     llmMessageFree(&resp->message);
     free(resp->finishReason);
     free(resp->rawJson);
+
+    for (size_t i = 0; i < resp->citationCount; i++)
+    {
+        free((void*)resp->citations[i].url);
+        free((void*)resp->citations[i].title);
+        free((void*)resp->citations[i].citedText);
+    }
+    free(resp->citations);
+
     free(resp);
 }
 

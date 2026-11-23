@@ -137,6 +137,7 @@ typedef enum
     LLMMAPI_PART_THINKING,    // text: reasoning (assistant output only)
     LLMMAPI_PART_TOOL_CALL,   // toolCallId + toolName + text(arguments JSON)
     LLMMAPI_PART_TOOL_RESULT, // toolCallId + text(result content)
+    LLMMAPI_PART_RAW_BLOCK,   // provider + rawJson (provider-native block)
 } LlmmapiPartType;
 
 typedef struct
@@ -150,6 +151,8 @@ typedef struct
     char* fileId;     // FILE (provider-side file reference, if any)
     char* toolCallId; // TOOL_CALL / TOOL_RESULT
     char* toolName;   // TOOL_CALL
+    char* provider;   // RAW_BLOCK: "anthropic", "openai", "openai-responses"
+    char* rawJson;    // RAW_BLOCK: raw provider block/item JSON object
 } LlmmapiPart;
 
 typedef struct
@@ -197,9 +200,25 @@ void llmapiMsgAddToolCall(LlmmapiMessage* msg, const char* toolCallId,
 void llmapiMsgAddToolResult(LlmmapiMessage* msg, const char* toolCallId,
                             const char* content);
 
+// Add a provider-native content block/output item (e.g. Anthropic
+// server_tool_use / web_search_tool_result, Responses web_search_call).
+// provider must be "anthropic", "openai" or "openai-responses".  The block is
+// only emitted when it matches the active provider; it is skipped otherwise.
+// jsonObject must be a JSON object; returns 0 on success, non-zero on invalid
+// input.
+int llmapiMsgAddRawBlock(LlmmapiMessage* msg,
+                         const char* provider,
+                         const char* jsonObject);
+
 // Register a tool. parametersJson is a JSON Schema object string.
 void llmapiReqAddTool(LlmmapiReq* req, const char* name,
                       const char* description, const char* parametersJson);
+
+// Append a provider-native tool object to the "tools" array verbatim.
+// jsonObject must be a JSON object (the library does not parse its fields).
+// Returns 0 on success, non-zero when jsonObject is not a valid JSON object.
+// Example: llmapiReqAddRawTool(req, "{\"type\":\"deepseek_web_search\"}");
+int llmapiReqAddRawTool(LlmmapiReq* req, const char* jsonObject);
 
 void llmapiReqSetMaxTokens(LlmmapiReq* req, size_t maxTokens);
 void llmapiReqSetTemperature(LlmmapiReq* req, double temp);
@@ -234,6 +253,23 @@ void llmapiRespGetUsage(const LlmmapiResp* resp,
 // Borrowed raw provider response body, or NULL.
 const char* llmapiRespGetRawJson(const LlmmapiResp* resp);
 
+// A citation/source returned by a provider-side tool (e.g. web search).
+typedef struct
+{
+    const char* url;        // always set when a citation is returned
+    const char* title;      // may be NULL
+    const char* citedText;  // quoted fragment, may be NULL
+    long        startIndex; // -1 when unknown
+    long        endIndex;   // -1 when unknown
+} LlmmapiCitation;
+
+// Number of citations in a response (0 when none).
+size_t llmapiRespGetCitationCount(const LlmmapiResp* resp);
+
+// Borrowed citation, or NULL when idx is out of range.
+const LlmmapiCitation* llmapiRespGetCitation(const LlmmapiResp* resp,
+                                             size_t idx);
+
 void llmapiRespFree(LlmmapiResp* resp);
 
 // ==================== Completion ====================
@@ -246,10 +282,12 @@ LlmmapiResp* llmapiChatComplete(LlmmapiCtx* ctx,
 // Neutral streaming events.
 typedef enum
 {
-    LLMAPI_STREAM_TEXT,       // text delta
-    LLMAPI_STREAM_THINKING,   // reasoning delta
-    LLMAPI_STREAM_TOOL_CALL,  // tool name/id (when known) and arguments delta
-    LLMAPI_STREAM_DONE,       // final event
+    LLMAPI_STREAM_TEXT,        // text delta
+    LLMAPI_STREAM_THINKING,    // reasoning delta
+    LLMAPI_STREAM_TOOL_CALL,   // tool name/id (when known) and arguments delta
+    LLMAPI_STREAM_CITATION,    // a source citation (see ev->citation)
+    LLMAPI_STREAM_SERVER_TOOL, // provider-side tool status (see ev->status)
+    LLMAPI_STREAM_DONE,        // final event
 } LlmmapiStreamType;
 
 typedef struct
@@ -257,8 +295,11 @@ typedef struct
     LlmmapiStreamType type;
     const char*       text;       // TEXT / THINKING / partial tool arguments
     const char*       toolCallId; // TOOL_CALL (may be NULL on later deltas)
-    const char*       toolName;   // TOOL_CALL (may be NULL on later deltas)
-    size_t            toolIndex;  // TOOL_CALL index
+    const char*       toolName;   // TOOL_CALL / SERVER_TOOL name
+    size_t            toolIndex;  // TOOL_CALL / SERVER_TOOL index
+    const LlmmapiCitation* citation; // CITATION (valid only during callback)
+    const char*       status;     // SERVER_TOOL phase: "started", "in_progress",
+                                  // "searching", "completed", ...
 } LlmmapiStreamEvent;
 
 typedef void (*LlmmapiStreamCb)(const LlmmapiStreamEvent* ev, void* userdata);

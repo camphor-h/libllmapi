@@ -183,7 +183,58 @@ provider 会自动翻译：
 - OpenAI：`tool_calls` / role `tool`
 - Anthropic：`tool_use` / `tool_result` content blocks
 
-### 7. 原始请求
+### 7. 服务端工具与引用
+
+有些 provider 自带服务端执行的工具（如联网搜索）。它们在 `tools` 数组里
+**不是 function 形状**，用 `llmapiReqAddRawTool` 原样加入：
+
+```c
+// Anthropic / DeepSeek（Anthropic 兼容）：需要 name 时自己写上
+llmapiReqAddRawTool(req, "{\"type\":\"deepseek_web_search\","
+                         "\"name\":\"deepseek_web_search\"}");
+llmapiReqAddRawTool(req, "{\"type\":\"deepseek_read_url\","
+                         "\"name\":\"deepseek_read_url\"}");
+
+// OpenAI Responses
+llmapiReqAddRawTool(req, "{\"type\":\"web_search\"}");
+```
+
+非法 JSON / 非对象时返回非 0。库只原样追加，不补字段、不改写。
+
+引用（来源）从响应里取：
+
+```c
+size_t n = llmapiRespGetCitationCount(resp);
+for (size_t i = 0; i < n; i++)
+{
+    const LlmmapiCitation* c = llmapiRespGetCitation(resp, i);
+    printf("%s (%s)\n", c->url, c->title ? c->title : "");
+}
+```
+
+流式事件：
+- `LLMAPI_STREAM_CITATION`：`ev->citation` 指向仅在回调期间有效的引用；
+- `LLMAPI_STREAM_SERVER_TOOL`：`ev->text` 是工具名，`ev->status` 是阶段
+  （`"started"` / `"in_progress"` / `"searching"` / `"completed"`）。
+
+多轮对话时，把上一轮的服务端工具块原样回传（Anthropic 要求
+`server_tool_use` / `web_search_tool_result`）：
+
+```c
+const LlmmapiMessage* m = llmapiRespGetMessage(resp);
+LlmmapiMessage* a = llmapiReqAddMessage(req, LLMAPI_ROLE_ASSISTANT);
+for (size_t i = 0; i < llmapiMessageGetPartCount(m); i++)
+{
+    const LlmmapiPart* p = llmapiMessageGetPart(m, i);
+    if (p->type == LLMMAPI_PART_RAW_BLOCK)
+        llmapiMsgAddRawBlock(a, p->provider, p->rawJson);
+}
+```
+
+只有 `provider` 与当前协议一致时才会输出（`"anthropic"` / `"openai"` /
+`"openai-responses"`），否则跳过。
+
+### 8. 原始请求
 
 通过注入的 transport 发送任意字节（使用当前 provider 的鉴权方式）：
 
@@ -229,6 +280,8 @@ char* resp = llmapiRequest(ctx, "https://api.openai.com/v1", "sk-...",
 | `llmapiMsgAddToolCall(msg, id, name, argsJson)` | 添加 TOOL_CALL |
 | `llmapiMsgAddToolResult(msg, id, content)` | 添加 TOOL_RESULT |
 | `llmapiReqAddTool(req, name, description, schemaJson)` | 定义工具 |
+| `llmapiReqAddRawTool(req, jsonObject)` | 追加 provider 原生工具对象 |
+| `llmapiMsgAddRawBlock(msg, provider, json)` | 添加 provider 原生块（用于历史回传） |
 | `llmapiReqSetMaxTokens` / `SetTemperature` / `SetTopP` | 生成参数 |
 | `llmapiReqSetStop(req, jsonArray)` | 停止序列 |
 | `llmapiReqSetExtra(req, key, json)` | provider 原生顶层参数 |
@@ -251,6 +304,8 @@ char* resp = llmapiRequest(ctx, "https://api.openai.com/v1", "sk-...",
 | `llmapiRespGetFinishReason(resp)` | 借用的结束原因 |
 | `llmapiRespGetUsage(resp, &in, &out, &total)` | token 用量 |
 | `llmapiRespGetRawJson(resp)` | 借用的原始响应 |
+| `llmapiRespGetCitationCount(resp)` | 引用数量 |
+| `llmapiRespGetCitation(resp, i)` | 借用的引用（`url` / `title` / `citedText`） |
 | `llmapiRespFree(resp)` | 释放响应 |
 
 ### 原始请求

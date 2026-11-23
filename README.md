@@ -187,7 +187,64 @@ The provider translates:
 - OpenAI: `tool_calls` / role `tool`
 - Anthropic: `tool_use` / `tool_result` content blocks
 
-### 7. Raw request
+### 7. Server-side tools & citations
+
+Some providers run tools on their side (web search). Their entries in the
+`tools` array are not `function` objects, so add them verbatim with
+`llmapiReqAddRawTool`:
+
+```c
+// Anthropic / DeepSeek (Anthropic-compatible): include a name when required
+llmapiReqAddRawTool(req, "{\"type\":\"deepseek_web_search\","
+                         "\"name\":\"deepseek_web_search\"}");
+llmapiReqAddRawTool(req, "{\"type\":\"deepseek_read_url\","
+                         "\"name\":\"deepseek_read_url\"}");
+
+// OpenAI Responses
+llmapiReqAddRawTool(req, "{\"type\":\"web_search\"}");
+```
+
+`llmapiReqAddRawTool` returns non-zero for invalid JSON or non-object input.
+The library appends the objects verbatim and does not add or rewrite fields
+(so include `name` where the provider requires it).
+
+Citations are available on the response:
+
+```c
+size_t n = llmapiRespGetCitationCount(resp);
+for (size_t i = 0; i < n; i++)
+{
+    const LlmmapiCitation* c = llmapiRespGetCitation(resp, i);
+    printf("%s (%s)\n", c->url, c->title ? c->title : "");
+}
+```
+
+Streaming emits:
+- `LLMAPI_STREAM_CITATION` — `ev->citation` points to a citation valid only
+  during the callback.
+- `LLMAPI_STREAM_SERVER_TOOL` — `ev->text` is the tool name and `ev->status`
+  is a phase such as `"started"`, `"in_progress"`, `"searching"`,
+  `"completed"`.
+
+To replay provider-native blocks in later turns (Anthropic requires the
+`server_tool_use` / `web_search_tool_result` blocks to be sent back), copy
+`LLMMAPI_PART_RAW_BLOCK` parts from the response into the assistant message:
+
+```c
+const LlmmapiMessage* m = llmapiRespGetMessage(resp);
+LlmmapiMessage* a = llmapiReqAddMessage(req, LLMAPI_ROLE_ASSISTANT);
+for (size_t i = 0; i < llmapiMessageGetPartCount(m); i++)
+{
+    const LlmmapiPart* p = llmapiMessageGetPart(m, i);
+    if (p->type == LLMMAPI_PART_RAW_BLOCK)
+        llmapiMsgAddRawBlock(a, p->provider, p->rawJson);
+}
+```
+
+A raw block is only emitted when its `provider` matches the active protocol
+(`"anthropic"`, `"openai"`, `"openai-responses"`); others are skipped.
+
+### 8. Raw request
 
 Send arbitrary bytes through the injected transport (uses the selected
 provider's auth scheme):
@@ -234,6 +291,8 @@ Buffers the whole response; not for streaming.
 | `llmapiMsgAddToolCall(msg, id, name, argsJson)` | Add TOOL_CALL |
 | `llmapiMsgAddToolResult(msg, id, content)` | Add TOOL_RESULT |
 | `llmapiReqAddTool(req, name, description, schemaJson)` | Define a tool |
+| `llmapiReqAddRawTool(req, jsonObject)` | Append a provider-native tool object |
+| `llmapiMsgAddRawBlock(msg, provider, json)` | Add a provider-native block for replay |
 | `llmapiReqSetMaxTokens` / `SetTemperature` / `SetTopP` | Generation params |
 | `llmapiReqSetStop(req, jsonArray)` | Stop sequences |
 | `llmapiReqSetExtra(req, key, json)` | Provider-native top-level param |
@@ -256,6 +315,8 @@ Buffers the whole response; not for streaming.
 | `llmapiRespGetFinishReason(resp)` | Borrowed finish/stop reason |
 | `llmapiRespGetUsage(resp, &in, &out, &total)` | Token usage |
 | `llmapiRespGetRawJson(resp)` | Borrowed raw provider response |
+| `llmapiRespGetCitationCount(resp)` | Number of citations |
+| `llmapiRespGetCitation(resp, i)` | Borrowed citation (`url` / `title` / `citedText`) |
 | `llmapiRespFree(resp)` | Free a response |
 
 ### Raw Request
